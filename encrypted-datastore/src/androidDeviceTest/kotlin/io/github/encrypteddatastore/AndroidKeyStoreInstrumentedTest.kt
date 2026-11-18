@@ -1,30 +1,64 @@
 package io.github.encrypteddatastore
 
 import android.content.Context
+import android.os.Build
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.security.KeyStore
 
 /**
- * Instrumented tests executed on a real Android Emulator / Device with genuine `AndroidKeyStore`.
+ * Instrumented tests executed on an Android Emulator / Device with genuine `AndroidKeyStore`.
  */
 @RunWith(AndroidJUnit4::class)
 class AndroidKeyStoreInstrumentedTest {
 
+    private val storeName = "instrumented_keystore_vault"
+
     private fun appContext(): Context = ApplicationProvider.getApplicationContext()
+
+    private fun isEmulator(): Boolean {
+        val fp = Build.FINGERPRINT
+        val hw = Build.HARDWARE
+        val model = Build.MODEL
+        return fp.startsWith("generic") ||
+            fp.startsWith("unknown") ||
+            model.contains("google_sdk") ||
+            model.contains("Emulator") ||
+            model.contains("Android SDK built for") ||
+            hw.contains("goldfish") ||
+            hw.contains("ranchu")
+    }
+
+    @Before
+    fun cleanStoreBeforeTest() {
+        val ctx = appContext()
+        val storeDir = File(ctx.noBackupFilesDir, "encrypted_datastore")
+        listOf(".edst", ".keyset", ".meta", ".swkek").forEach { ext ->
+            File(storeDir, "$storeName$ext").delete()
+        }
+        runCatching {
+            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            val alias = AndroidKeyStoreAead.buildAlias(ctx.packageName, storeName)
+            if (ks.containsAlias(alias)) {
+                ks.deleteEntry(alias)
+            }
+        }
+    }
 
     @Test
     fun hardwareBackedStoreStrictRoundTripRotationTamperAndForceReset() = runTest {
         val ctx = appContext()
         val storageCtx = PlatformStorageContext(ctx)
         val config = SecurityConfig(
-            storeName = "instrumented_keystore_vault",
+            storeName = storeName,
             algorithm = CipherAlgorithm.AES256_GCM,
             recoveryPolicy = KeystoreRecoveryPolicy.STRICT,
             preferStrongBox = true,
@@ -35,10 +69,25 @@ class AndroidKeyStoreInstrumentedTest {
         prefs.edit { it[tokenKey] = "real_keystore_secret_123" }
 
         val diag = prefs.diagnostics()
-        assertTrue(
-            "Expected hardware-backed Keystore on Android device/emulator, got ${diag.securityLevel}",
-            diag.hardwareBacked && (diag.securityLevel == SecurityLevel.HARDWARE_TEE || diag.securityLevel == SecurityLevel.STRONGBOX),
-        )
+        if (isEmulator()) {
+            // Android Emulators may report software-emulated Keystore in KeyInfo despite using AndroidKeyStore.
+            assertTrue(
+                "Unexpected securityLevel on emulator: ${diag.securityLevel}",
+                diag.securityLevel in setOf(
+                    SecurityLevel.HARDWARE_TEE,
+                    SecurityLevel.STRONGBOX,
+                    SecurityLevel.SOFTWARE_FALLBACK,
+                ),
+            )
+        } else {
+            assertTrue(
+                "Expected hardware-backed Keystore on physical Android device, got ${diag.securityLevel}",
+                diag.hardwareBacked && (
+                    diag.securityLevel == SecurityLevel.HARDWARE_TEE ||
+                        diag.securityLevel == SecurityLevel.STRONGBOX
+                    ),
+            )
+        }
         assertEquals(2L, prefs.rotateKeys())
         prefs.close()
 

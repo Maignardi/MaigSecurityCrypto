@@ -6,7 +6,6 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
-import android.security.keystore.StrongBoxUnavailableException
 import android.security.keystore.UserNotAuthenticatedException
 import com.google.crypto.tink.Aead
 import java.security.GeneralSecurityException
@@ -185,24 +184,26 @@ internal class AndroidKeyStoreAead(
             .setRandomizedEncryptionRequired(true)
 
         if (useStrongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            specBuilder.setIsStrongBoxBacked(true)
+            Api28KeyStoreImpl.setIsStrongBoxBacked(specBuilder, true)
         }
 
         config.userAuthConfig?.let { auth ->
             specBuilder.setUserAuthenticationRequired(true)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val authTypes = if (auth.allowDeviceCredential) {
-                    KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL
-                } else {
-                    KeyProperties.AUTH_BIOMETRIC_STRONG
-                }
-                specBuilder.setUserAuthenticationParameters(auth.authValidityDurationSeconds, authTypes)
+                Api30KeyStoreImpl.setUserAuthenticationParameters(
+                    builder = specBuilder,
+                    timeoutSeconds = auth.authValidityDurationSeconds,
+                    allowDeviceCredential = auth.allowDeviceCredential,
+                )
             } else {
                 @Suppress("DEPRECATION")
                 specBuilder.setUserAuthenticationValidityDurationSeconds(auth.authValidityDurationSeconds)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                specBuilder.setInvalidatedByBiometricEnrollment(auth.invalidateOnBiometricEnrollment)
+                Api24KeyStoreImpl.setInvalidatedByBiometricEnrollment(
+                    builder = specBuilder,
+                    invalidate = auth.invalidateOnBiometricEnrollment,
+                )
             }
         }
 
@@ -218,12 +219,7 @@ internal class AndroidKeyStoreAead(
             val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
             val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                when (info.securityLevel) {
-                    KeyProperties.SECURITY_LEVEL_STRONGBOX -> SecurityLevel.STRONGBOX
-                    KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> SecurityLevel.HARDWARE_TEE
-                    KeyProperties.SECURITY_LEVEL_SOFTWARE -> SecurityLevel.SOFTWARE_FALLBACK
-                    else -> SecurityLevel.UNKNOWN
-                }
+                Api31KeyStoreImpl.resolveSecurityLevel(info)
             } else {
                 @Suppress("DEPRECATION")
                 if (info.isInsideSecureHardware) SecurityLevel.HARDWARE_TEE else SecurityLevel.SOFTWARE_FALLBACK
@@ -238,7 +234,9 @@ internal class AndroidKeyStoreAead(
     private fun isStrongBoxFallbackCandidate(t: Throwable): Boolean {
         var cur: Throwable? = t
         while (cur != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && cur is StrongBoxUnavailableException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                Api28KeyStoreImpl.isStrongBoxUnavailableException(cur)
+            ) {
                 return true
             }
             if (cur is ProviderException || cur is KeyStoreException) {

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-11-18
+
+### Fixed
+- **CI `Publish to GitHub Packages` workflow:** Replaced Bash 4 `${OWNER,,}` with POSIX-compatible `tr` so `publish.yml` succeeds on `macos-15` Bash 3.2.
+- **Android instrumented tests (`AndroidKeyStoreInstrumentedTest`):** Added `@Before` test cleanup and emulator detection so software-emulated `KeyInfo` on Android Emulator AVDs is handled accurately while physical devices still assert hardware-backed TEE/StrongBox.
+- **Full API 23 bytecode verification:** Replaced the custom two-package token scan with **Animal Sniffer** (`org.codehaus.mojo:animal-sniffer` + `com.toasttab.android:gummy-bears-api-23`), isolating `Build.VERSION.SDK_INT`-gated Android KeyStore API 24/28/30/31 calls into `AndroidKeyStoreApiCompat.kt` and removing the no-op `lint` block from the KMP library build script.
+
 ## [0.2.1] - 2026-11-18
 
 ### Breaking Changes
