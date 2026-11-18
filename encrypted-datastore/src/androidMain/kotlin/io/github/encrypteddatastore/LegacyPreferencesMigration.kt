@@ -17,14 +17,22 @@ public data class SharedPreferencesMigrationReport(
 /**
  * DataStore-integrated [EncryptedPreferencesMigration] that runs atomically before any reads or
  * writes are served when passed to [EncryptedDataStoreFactory.createPreferences].
+ *
+ * @param migrationId Unique identifier for this migration source (for example, `"legacy_auth_prefs"`).
+ * Using a distinct [migrationId] per [SharedPreferences] source prevents collisions when multiple
+ * sources migrate into the same [EncryptedPreferences].
  */
 public class SharedPreferencesDataMigration(
     private val source: SharedPreferences,
+    private val migrationId: String,
     private val keysToMigrate: Set<String>? = null,
     private val clearSourceOnSuccess: Boolean = true,
     private val overwriteExisting: Boolean = false,
-    private val migrationId: String = "shared_prefs_default",
 ) : EncryptedPreferencesMigration {
+
+    init {
+        require(migrationId.isNotBlank()) { "migrationId must not be blank" }
+    }
 
     override suspend fun shouldMigrate(snapshot: EncryptedPreferencesSnapshot): Boolean {
         if (snapshot.hasCompletedMigration(migrationId)) return false

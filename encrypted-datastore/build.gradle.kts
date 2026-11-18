@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.zip.ZipFile
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -15,7 +16,7 @@ val resolvedGroup = providers.gradleProperty("group").orNull
 val resolvedVersion = providers.gradleProperty("version").orNull
     ?.takeIf { it.isNotBlank() && it != "unspecified" }
     ?: System.getenv("VERSION")?.takeIf { it.isNotBlank() }
-    ?: "0.2.0"
+    ?: "0.2.1"
 
 group = resolvedGroup
 version = resolvedVersion
@@ -39,6 +40,15 @@ kotlin {
         minSdk = 23
 
         withHostTestBuilder {
+        }
+
+        withDeviceTest {
+            instrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        }
+
+        lint {
+            abortOnError = true
+            error += "NewApi"
         }
 
         optimization {
@@ -90,6 +100,13 @@ kotlin {
             implementation(libs.androidx.test.core)
         }
 
+        getByName("androidDeviceTest").dependencies {
+            implementation(libs.androidx.test.runner)
+            implementation(libs.androidx.test.junit)
+            implementation(libs.androidx.test.core)
+            implementation(libs.kotlinx.coroutines.test)
+        }
+
         jvmMain.dependencies {
             implementation(libs.tink.jvm)
         }
@@ -103,6 +120,39 @@ kotlin {
             implementation(libs.cryptography.provider.apple)
         }
     }
+}
+
+val verifyAndroidMinSdk23Compatibility = tasks.register("verifyAndroidMinSdk23Compatibility") {
+    group = "verification"
+    description = "Scans compiled androidMain bytecode for API 26+ java.nio.file / java.time references."
+    val compileJarTask = tasks.named("bundleAndroidMainClassesToCompileJar")
+    dependsOn(compileJarTask)
+    inputs.files(compileJarTask)
+    doLast {
+        val jarFile = compileJarTask.get().outputs.files.singleFile
+        val forbiddenTokens = listOf("java/nio/file/", "java/time/")
+        val violations = mutableListOf<String>()
+        ZipFile(jarFile).use { zip ->
+            zip.entries().asSequence()
+                .filter { !it.isDirectory && it.name.endsWith(".class") }
+                .forEach { entry ->
+                    val bytes = zip.getInputStream(entry).readBytes()
+                    val text = bytes.toString(Charsets.ISO_8859_1)
+                    forbiddenTokens.forEach { token ->
+                        if (text.contains(token)) {
+                            violations += "${entry.name} references forbidden API 26+ package '$token'"
+                        }
+                    }
+                }
+        }
+        if (violations.isNotEmpty()) {
+            throw GradleException("minSdk=23 bytecode check failed:\n" + violations.joinToString("\n"))
+        }
+    }
+}
+
+tasks.named("check").configure {
+    dependsOn(verifyAndroidMinSdk23Compatibility)
 }
 
 publishing {

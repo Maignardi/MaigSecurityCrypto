@@ -2,24 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - 2026-11-18
+## [0.2.1] - 2026-11-18
 
 ### Breaking Changes
-- **iOS default cipher algorithm changed to `CipherAlgorithm.AES256_CTR_HMAC_SHA256`:** `cryptography-provider-apple` wraps Apple `CommonCrypto`, which does not provide `AES-GCM`. `IosKeychainKeyManager` now uses `AES-256-CTR + HMAC-SHA256` Encrypt-then-MAC (`IosAesCtrHmacCipher`) and rejects `AES256_GCM` / `XCHACHA20_POLY1305` explicitly on iOS. `SecurityConfig.algorithm` defaults per platform (`AES256_GCM` on Android/JVM, `AES256_CTR_HMAC_SHA256` on iOS).
+- `SharedPreferencesDataMigration` now requires an explicit `migrationId: String` parameter (removed the default `"shared_prefs_default"` value) so multiple `SharedPreferences` sources cannot silently collide on migration completion tracking.
+
+### Added
+- `verifyAndroidMinSdk23Compatibility` Gradle verification task (wired to `check` and CI) scanning `androidMain` compiled classes for API 26+ `java.nio.file` / `java.time` references, since `com.android.kotlin.multiplatform.library` does not run standalone lint reports on `androidMain`.
+- Independent Known-Answer Test (KAT) vector for `IosAesCtrHmacCipher` generated externally with Python `hmac`/`hashlib` and `openssl enc -aes-256-ctr`.
+- Real `AndroidKeyStore` instrumented test suite in `androidDeviceTest` (`AndroidKeyStoreInstrumentedTest`) and an `android-emulator` job in GitHub Actions CI.
+
+### Fixed
+- `EncryptedPreferences.clearAndReset()` now preserves `completedMigrations` so legacy `SharedPreferences` (when `clearSourceOnSuccess = false`) do not re-import old data on the next app launch after logout.
+
+## [0.2.0] - 2026-11-18
+
+### Breaking Changes (Cumulative vs 0.1.0)
+- **iOS default cipher algorithm changed to `CipherAlgorithm.AES256_CTR_HMAC_SHA256`:** `cryptography-provider-apple` wraps Apple `CommonCrypto`, which does not provide `AES-GCM`. `IosKeychainKeyManager` uses `AES-256-CTR + HMAC-SHA256` Encrypt-then-MAC (`IosAesCtrHmacCipher`) and explicitly rejects `AES256_GCM` and `XCHACHA20_POLY1305` on iOS. `SecurityConfig.algorithm` defaults per platform (`AES256_GCM` on Android/JVM, `AES256_CTR_HMAC_SHA256` on iOS).
+- **`SecurityConfig` is no longer a `data class`:** Converted to a regular class with explicit `equals`/`hashCode`/`toString` excluding lambda callbacks (`copy()` was removed).
+- **`PlatformStorageContext` (`androidMain`):** Removed `useNoBackupDir` constructor parameter; Android stores always use `noBackupFilesDir`.
+- **`SecurityLevel` enum:** Removed unused `SECURE_ENCLAVE` and misleading `JVM_KEYSTORE`; added `PASSPHRASE_PBKDF2`, `LOCAL_FILE_KEK`, and `UNKNOWN`.
+- **`SharedPreferencesMigrationReport`:** Added `skippedExistingKeys: Set<String>` property.
 - **Tightened configuration validation:** `KeyRotationPolicy.Automatic` requires `maxRetainedKeys >= 2`; `UserAuthConfig` requires `authValidityDurationSeconds > 0`; `EXPLICIT_SOFTWARE_FALLBACK` cannot be combined with `UserAuthConfig`.
 
 ### Added
 - `forceResetAndClose()` on `EncryptedDataStore` and `EncryptedPreferences` to wipe corrupted/invalidated `STRICT` stores without decrypting or eagerly recreating auth-bound keys.
-- `EncryptedPreferencesMigration` interface + `SharedPreferencesDataMigration` integrated with Jetpack `DataStore` `DataMigration` pipeline (including persistent `completedMigrations` tracking for `overwriteExisting = true` + `clearSourceOnSuccess = false`).
+- `EncryptedPreferencesMigration` interface and `SharedPreferencesDataMigration` integrated with Jetpack `DataStore`'s `DataMigration` pipeline.
 - Expiring `LAContext` management (`invalidate()` after `authValidityDurationSeconds`) on iOS Keychain authentication.
-- Android Lint (`lintAndroidMain`) added to CI alongside JVM, Android host, Compose UI, and iOS simulator test suites.
 
 ### Fixed
-- **Android API 23–25 compatibility:** Replaced `java.nio.file.*` (`API 26+`) in `AndroidTinkKeyManager.atomicWriteFile` with `android.system.Os` (`open`/`chmod`/`rename`/`fsync`) for full `minSdk = 23` compatibility.
-- **JVM backward compatibility:** Reverted JVM keyset/metadata AAD to `storeName` (matching `0.1.0`/`0.1.1`), with automatic migration if an existing `0.1.2` keyset is encountered.
+- **Android API 23–25 compatibility:** Replaced `java.nio.file.*` (`API 26+`) in `AndroidTinkKeyManager.atomicWriteFile` with `android.system.Os` (`open`/`chmod`/`rename`/`fsync`) plus safe rename fallback for Robolectric.
+- **JVM backward compatibility:** Reverted JVM keyset/metadata AAD to `storeName` (matching `0.1.0`/`0.1.1`), with automatic migration for any `0.1.2` keyset.
 - **JVM passphrase handling:** Unvalidated KEKs are no longer cached on `parseEncryptedKeyset` failure, wrong passphrases never trigger `CLEAR_AND_REGENERATE` wipes, and caller `CharArray` buffers are copied before wiping.
 - **Recovery safety:** Transient `KeystoreUnavailableException`, `KeyManagementException`, and `UserAuthenticationRequiredException` (including iOS `errSecUserCanceled`) never trigger `CLEAR_AND_REGENERATE` data wipes.
-- **Sample app:** Moved `EncryptedPreferences` singleton into `SampleApplication` to prevent `DataStore` multi-instance crashes on configuration changes.
+- **Sample app:** Moved `EncryptedPreferences` singleton into `SampleApplication` to prevent `DataStore` multi-instance crashes on rotation.
+
+## [0.1.2] - 2026-11-18
+- Attempted `android.system.Os` atomic writes, `forceResetAndClose()`, `LAContext` reuse on iOS, and `SharedPreferencesDataMigration` (superseded by `0.2.0` due to breaking iOS cipher change and JVM AAD regression).
+
+## [0.1.1] - 2026-11-18
+- Hardened `EXPLICIT_SOFTWARE_FALLBACK` against `UserAuthConfig`, added `CharArray` copy in JVM PBKDF2, moved `SampleApplication` singleton setup, and added `iosSimulatorArm64Test`.
 
 ## [0.1.0] - 2026-11-18
 - Initial release with `EncryptedDataStore`, `EncryptedPreferences`, authenticated `EDST` binary envelope, Google Tink, `AndroidKeyStore`/StrongBox, iOS Keychain, and JVM PBKDF2 support.

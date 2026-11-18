@@ -73,6 +73,27 @@ class IosEncryptedDataStoreTest {
     }
 
     @Test
+    fun `IosAesCtrHmacCipher matches independent Python and OpenSSL known-answer test vector`() = runTest {
+        val masterKey = ByteArray(32) { it.toByte() }
+        val iv = ByteArray(16) { (0x10 + it).toByte() }
+        val aad = "EDST_IOS_KAT_AAD".encodeToByteArray()
+        val plaintext = "Hello, EncryptedDataStore KAT!".encodeToByteArray()
+
+        // Generated independently via Python hmac/hashlib + `openssl enc -aes-256-ctr`
+        val expectedHex =
+            "101112131415161718191a1b1c1d1e1f" +
+                "a2bd229e691afb144846ef49f134bf3cd7e69d62415bfa35cedee5fb3e2c" +
+                "a9a6e7bd5768b6da8db86ee9d2b00a2d57eb0019dd1b19abef96a4a52c0440a3"
+        val expectedPayload = expectedHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+        val actualPayload = IosAesCtrHmacCipher.encrypt(masterKey, plaintext, aad, iv)
+        assertContentEquals(expectedPayload, actualPayload)
+
+        val actualPlaintext = IosAesCtrHmacCipher.decrypt(masterKey, expectedPayload, aad, "kat", 1L)
+        assertContentEquals(plaintext, actualPlaintext)
+    }
+
+    @Test
     fun `IosKeychainKeysetRecord serializes and deserializes cleanly`() {
         val record = IosKeychainKeysetRecord(
             currentEpoch = 3L,

@@ -243,7 +243,12 @@ class AndroidEncryptedDataStoreTest {
                 storeName = "auto_data_migration_target",
                 recoveryPolicy = KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK,
             ),
-            migrations = listOf(SharedPreferencesDataMigration(source = legacyPrefs)),
+            migrations = listOf(
+                SharedPreferencesDataMigration(
+                    source = legacyPrefs,
+                    migrationId = "auto_data_migration_legacy",
+                )
+            ),
         )
 
         // First read must already contain migrated values without any manual migration call
@@ -254,7 +259,7 @@ class AndroidEncryptedDataStoreTest {
     }
 
     @Test
-    fun `SharedPreferencesDataMigration with overwriteExisting and clearSource false runs only once`() = runTest {
+    fun `SharedPreferencesDataMigration with overwriteExisting and clearSource false runs only once and survives clearAndReset`() = runTest {
         val ctx = context()
         val legacyPrefs = ctx.getSharedPreferences("once_legacy_prefs", Context.MODE_PRIVATE)
         legacyPrefs.edit().putString("token", "legacy_v1").commit()
@@ -271,9 +276,9 @@ class AndroidEncryptedDataStoreTest {
             migrations = listOf(
                 SharedPreferencesDataMigration(
                     source = legacyPrefs,
+                    migrationId = "legacy_v1_import",
                     clearSourceOnSuccess = false,
                     overwriteExisting = true,
-                    migrationId = "legacy_v1_import",
                 )
             ),
         )
@@ -289,14 +294,34 @@ class AndroidEncryptedDataStoreTest {
             migrations = listOf(
                 SharedPreferencesDataMigration(
                     source = legacyPrefs,
+                    migrationId = "legacy_v1_import",
                     clearSourceOnSuccess = false,
                     overwriteExisting = true,
-                    migrationId = "legacy_v1_import",
                 )
             ),
         )
         assertEquals("new_app_token", prefs2.get(tokenKey))
+
+        // Logout wipe via clearAndReset() must clear entries while preserving completedMigrations
+        prefs2.clearAndReset()
+        assertNull(prefs2.get(tokenKey))
         prefs2.close()
+
+        // Reopen after logout: legacy_v1 must NOT resurrect!
+        val prefs3 = EncryptedDataStoreFactory.createPreferences(
+            context = storageCtx,
+            config = config,
+            migrations = listOf(
+                SharedPreferencesDataMigration(
+                    source = legacyPrefs,
+                    migrationId = "legacy_v1_import",
+                    clearSourceOnSuccess = false,
+                    overwriteExisting = true,
+                )
+            ),
+        )
+        assertNull(prefs3.get(tokenKey))
+        prefs3.close()
     }
 
     @Test

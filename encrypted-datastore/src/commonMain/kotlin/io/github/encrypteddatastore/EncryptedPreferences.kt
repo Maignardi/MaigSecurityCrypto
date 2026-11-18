@@ -268,7 +268,12 @@ public class EncryptedPreferences internal constructor(
     public suspend fun rotateKeys(): Long = store.rotateKeys()
 
     public suspend fun clearAndReset() {
-        store.clearAndReset()
+        store.clearAndReset { previous ->
+            EncryptedPreferencesState(
+                entries = emptyMap(),
+                completedMigrations = previous.completedMigrations,
+            )
+        }
     }
 
     /**

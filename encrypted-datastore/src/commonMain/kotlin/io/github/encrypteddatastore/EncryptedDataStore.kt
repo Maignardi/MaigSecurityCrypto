@@ -86,10 +86,14 @@ public class EncryptedDataStore<T> internal constructor(
      * or invalidated under [KeystoreRecoveryPolicy.STRICT], use [forceResetAndClose] instead.
      */
     public suspend fun clearAndReset() {
+        clearAndReset { defaultValueProvider() }
+    }
+
+    internal suspend fun clearAndReset(resetValueTransform: (T) -> T) {
         operationMutex.withLock {
             val newEpoch = keyManager.rotateKey(maxRetainedKeys = 2, trigger = "clear_and_reset")
-            internalStore.updateData {
-                EncryptedBox(value = defaultValueProvider(), keyEpoch = newEpoch)
+            internalStore.updateData { box ->
+                EncryptedBox(value = resetValueTransform(box.value), keyEpoch = newEpoch)
             }
             keyManager.pruneHistoricalKeys()
             enforceRestrictiveFilePermissions(fileSystem, filePath)
