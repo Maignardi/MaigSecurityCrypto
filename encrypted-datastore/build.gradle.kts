@@ -15,7 +15,7 @@ val resolvedGroup = providers.gradleProperty("group").orNull
 val resolvedVersion = providers.gradleProperty("version").orNull
     ?.takeIf { it.isNotBlank() && it != "unspecified" }
     ?: System.getenv("VERSION")?.takeIf { it.isNotBlank() }
-    ?: "0.1.2"
+    ?: "0.2.0"
 
 group = resolvedGroup
 version = resolvedVersion

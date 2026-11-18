@@ -493,6 +493,58 @@ class EncryptedDataStoreSecurityTest {
     }
 
     @Test
+    fun `opens JVM store encrypted with legacy 0_1_2 storeName-duplicated AAD and migrates it`() = runTest {
+        val storeName = "legacy_v012_store"
+        val storeDir = tempFolder.root.toOkioPath() / "encrypted_datastore"
+        FileSystem.SYSTEM.createDirectories(storeDir)
+
+        // Create a valid store first, then re-wrap keyset and metadata with 0.1.2's "storeName:storeName" AAD
+        val store = EncryptedDataStoreFactory.create(
+            context = testContext { "pass123".toCharArray() },
+            config = SecurityConfig(storeName = storeName),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession() },
+        )
+        store.updateData { AuthSession(accessToken = "legacy_012_secret") }
+        store.close()
+
+        // Manually re-encrypt keyset with duplicated AAD ("legacy_v012_store:legacy_v012_store")
+        val salt = FileSystem.SYSTEM.read(storeDir / "$storeName.kek") { readByteArray() }
+        val factory = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val derived = factory.generateSecret(
+            javax.crypto.spec.PBEKeySpec("pass123".toCharArray(), salt, 310_000, 256)
+        ).encoded
+        val kekAead = com.google.crypto.tink.subtle.AesGcmJce(derived)
+        fun domainAad(tag: String, scope: String): ByteArray = okio.Buffer().apply {
+            val t = tag.encodeToByteArray()
+            val s = scope.encodeToByteArray()
+            writeInt(t.size); write(t); writeInt(s.size); write(s)
+        }.readByteArray()
+
+        val keysetBytes = FileSystem.SYSTEM.read(storeDir / "$storeName.keyset") { readByteArray() }
+        val handle = com.google.crypto.tink.TinkProtoKeysetFormat.parseEncryptedKeyset(
+            keysetBytes,
+            kekAead,
+            domainAad("EDST_KEYSET_V1", storeName),
+        )
+        val v012KeysetBytes = com.google.crypto.tink.TinkProtoKeysetFormat.serializeEncryptedKeyset(
+            handle,
+            kekAead,
+            domainAad("EDST_KEYSET_V1", "$storeName:$storeName"),
+        )
+        FileSystem.SYSTEM.write(storeDir / "$storeName.keyset") { write(v012KeysetBytes) }
+
+        val reopened = EncryptedDataStoreFactory.create(
+            context = testContext { "pass123".toCharArray() },
+            config = SecurityConfig(storeName = storeName),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession() },
+        )
+        assertEquals("legacy_012_secret", reopened.get().accessToken)
+        reopened.close()
+    }
+
+    @Test
     fun `EncryptedPreferences handles all types reactive observation and persistence`() = runTest {
         val prefs = EncryptedDataStoreFactory.createPreferences(
             context = testContext(),

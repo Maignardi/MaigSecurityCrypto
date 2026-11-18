@@ -100,10 +100,20 @@ public object EncryptedDataStoreFactory {
         val dataMigrations = migrations.map { prefMigration ->
             object : DataMigration<EncryptedPreferencesState> {
                 override suspend fun shouldMigrate(currentData: EncryptedPreferencesState): Boolean =
-                    prefMigration.shouldMigrate(EncryptedPreferencesSnapshot(currentData.entries, json))
+                    prefMigration.shouldMigrate(
+                        EncryptedPreferencesSnapshot(
+                            entries = currentData.entries,
+                            json = json,
+                            completedMigrations = currentData.completedMigrations,
+                        )
+                    )
 
                 override suspend fun migrate(currentData: EncryptedPreferencesState): EncryptedPreferencesState {
-                    val mutable = MutableEncryptedPreferences(currentData.entries, json)
+                    val mutable = MutableEncryptedPreferences(
+                        initialEntries = currentData.entries,
+                        json = json,
+                        initialCompletedMigrations = currentData.completedMigrations,
+                    )
                     prefMigration.migrate(mutable)
                     return mutable.toState()
                 }

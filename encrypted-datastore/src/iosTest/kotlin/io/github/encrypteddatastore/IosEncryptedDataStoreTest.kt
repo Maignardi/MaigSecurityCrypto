@@ -5,6 +5,7 @@ import kotlinx.serialization.json.Json
 import okio.FileSystem
 import okio.Path.Companion.toPath
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -32,6 +33,42 @@ class IosEncryptedDataStoreTest {
                     algorithm = CipherAlgorithm.AES256_GCM,
                 ),
             )
+        }
+    }
+
+    @Test
+    fun `IosAesCtrHmacCipher round-trip and detects tampering AAD mismatch and truncation`() = runTest {
+        val masterKey = ByteArray(32) { (it + 1).toByte() }
+        val iv = ByteArray(16) { (it + 10).toByte() }
+        val aad = "EDST_IOS_TEST_AAD".encodeToByteArray()
+        val plaintext = "sensitive_ios_payload_42".encodeToByteArray()
+
+        val payload = IosAesCtrHmacCipher.encrypt(masterKey, plaintext, aad, iv)
+        assertEquals(IosAesCtrHmacCipher.IV_BYTES + plaintext.size + IosAesCtrHmacCipher.MAC_TAG_BYTES, payload.size)
+
+        val decrypted = IosAesCtrHmacCipher.decrypt(masterKey, payload, aad, "kat_store", 1L)
+        assertContentEquals(plaintext, decrypted)
+
+        // Tamper ciphertext byte
+        val tamperedCt = payload.copyOf().apply { this[IosAesCtrHmacCipher.IV_BYTES] = (this[IosAesCtrHmacCipher.IV_BYTES].toInt() xor 0xFF).toByte() }
+        assertFailsWith<StoreTamperedOrCorruptedException> {
+            IosAesCtrHmacCipher.decrypt(masterKey, tamperedCt, aad, "kat_store", 1L)
+        }
+
+        // Tamper HMAC tag byte
+        val tamperedTag = payload.copyOf().apply { this[lastIndex] = (last().toInt() xor 0x01).toByte() }
+        assertFailsWith<StoreTamperedOrCorruptedException> {
+            IosAesCtrHmacCipher.decrypt(masterKey, tamperedTag, aad, "kat_store", 1L)
+        }
+
+        // Wrong AAD
+        assertFailsWith<StoreTamperedOrCorruptedException> {
+            IosAesCtrHmacCipher.decrypt(masterKey, payload, "WRONG_AAD".encodeToByteArray(), "kat_store", 1L)
+        }
+
+        // Truncated payload
+        assertFailsWith<StoreTamperedOrCorruptedException> {
+            IosAesCtrHmacCipher.decrypt(masterKey, ByteArray(10), aad, "kat_store", 1L)
         }
     }
 

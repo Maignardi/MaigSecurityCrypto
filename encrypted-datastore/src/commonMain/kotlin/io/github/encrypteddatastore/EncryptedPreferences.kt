@@ -45,6 +45,7 @@ internal data class PreferenceEntry(
 @Serializable
 internal data class EncryptedPreferencesState(
     val entries: Map<String, PreferenceEntry> = emptyMap(),
+    val completedMigrations: Set<String> = emptySet(),
 )
 
 private class StringPreferenceKey(name: String) : PreferenceKey<String>(name) {
@@ -147,12 +148,16 @@ public object PreferenceKeys {
         SerializablePreferenceKey(name, serializer)
 }
 
+internal fun EncryptedPreferencesSnapshot.hasCompletedMigration(migrationId: String): Boolean =
+    migrationId in completedMigrations
+
 /**
  * Immutable snapshot of decrypted preferences.
  */
 public class EncryptedPreferencesSnapshot internal constructor(
     private val entries: Map<String, PreferenceEntry>,
     private val json: Json,
+    internal val completedMigrations: Set<String> = emptySet(),
 ) {
     public operator fun <T> get(key: PreferenceKey<T>): T? {
         val entry = entries[key.name] ?: return null
@@ -180,8 +185,14 @@ public class EncryptedPreferencesSnapshot internal constructor(
 public class MutableEncryptedPreferences internal constructor(
     initialEntries: Map<String, PreferenceEntry>,
     private val json: Json,
+    initialCompletedMigrations: Set<String> = emptySet(),
 ) {
     private val mutableEntries = initialEntries.toMutableMap()
+    private val completedMigrations = initialCompletedMigrations.toMutableSet()
+
+    internal fun markMigrationCompleted(migrationId: String) {
+        completedMigrations += migrationId
+    }
 
     public operator fun <T> get(key: PreferenceKey<T>): T? {
         val entry = mutableEntries[key.name] ?: return null
@@ -209,7 +220,10 @@ public class MutableEncryptedPreferences internal constructor(
     }
 
     internal fun toState(): EncryptedPreferencesState =
-        EncryptedPreferencesState(entries = mutableEntries.toMap())
+        EncryptedPreferencesState(
+            entries = mutableEntries.toMap(),
+            completedMigrations = completedMigrations.toSet(),
+        )
 }
 
 /**
@@ -229,7 +243,7 @@ public class EncryptedPreferences internal constructor(
     private val json: Json,
 ) {
     public val data: Flow<EncryptedPreferencesSnapshot> = store.data
-        .map { EncryptedPreferencesSnapshot(it.entries, json) }
+        .map { EncryptedPreferencesSnapshot(it.entries, json, it.completedMigrations) }
         .distinctUntilChanged()
 
     public fun <T> observe(key: PreferenceKey<T>): Flow<T?> =
@@ -244,11 +258,11 @@ public class EncryptedPreferences internal constructor(
 
     public suspend fun edit(transform: suspend (MutableEncryptedPreferences) -> Unit): EncryptedPreferencesSnapshot {
         val updated = store.updateData { state ->
-            val mutable = MutableEncryptedPreferences(state.entries, json)
+            val mutable = MutableEncryptedPreferences(state.entries, json, state.completedMigrations)
             transform(mutable)
             mutable.toState()
         }
-        return EncryptedPreferencesSnapshot(updated.entries, json)
+        return EncryptedPreferencesSnapshot(updated.entries, json, updated.completedMigrations)
     }
 
     public suspend fun rotateKeys(): Long = store.rotateKeys()

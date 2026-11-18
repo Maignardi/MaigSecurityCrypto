@@ -97,18 +97,19 @@ public class EncryptedDataStore<T> internal constructor(
     }
 
     /**
-     * Forcefully wipes the encrypted file and resets all underlying key material without
-     * attempting to decrypt existing data, then closes this store instance.
+     * Forcefully wipes the encrypted file and destroys all underlying key material without
+     * attempting to decrypt existing data or eagerly recreating keys, then closes this instance.
      *
      * Intended as an explicit user-triggered recovery escape hatch when a store using
      * [KeystoreRecoveryPolicy.STRICT] encounters permanent key invalidation or corruption.
-     * After calling this method, create a new instance via [EncryptedDataStoreFactory].
+     * After calling this method, create a new instance via [EncryptedDataStoreFactory] (which
+     * will initialize fresh keys on demand).
      */
     public suspend fun forceResetAndClose() {
         operationMutex.withLock {
             storeScope.coroutineContext.job.cancelAndJoin()
             fileSystem.delete(filePath, mustExist = false)
-            keyManager.resetAndRegenerate(reason = "explicit_force_reset")
+            keyManager.destroyKeyMaterial()
         }
     }
 

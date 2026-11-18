@@ -254,6 +254,52 @@ class AndroidEncryptedDataStoreTest {
     }
 
     @Test
+    fun `SharedPreferencesDataMigration with overwriteExisting and clearSource false runs only once`() = runTest {
+        val ctx = context()
+        val legacyPrefs = ctx.getSharedPreferences("once_legacy_prefs", Context.MODE_PRIVATE)
+        legacyPrefs.edit().putString("token", "legacy_v1").commit()
+
+        val config = SecurityConfig(
+            storeName = "once_migration_target",
+            recoveryPolicy = KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK,
+        )
+        val storageCtx = PlatformStorageContext(ctx)
+
+        val prefs1 = EncryptedDataStoreFactory.createPreferences(
+            context = storageCtx,
+            config = config,
+            migrations = listOf(
+                SharedPreferencesDataMigration(
+                    source = legacyPrefs,
+                    clearSourceOnSuccess = false,
+                    overwriteExisting = true,
+                    migrationId = "legacy_v1_import",
+                )
+            ),
+        )
+        val tokenKey = PreferenceKeys.string("token")
+        assertEquals("legacy_v1", prefs1.get(tokenKey))
+        prefs1.edit { it[tokenKey] = "new_app_token" }
+        prefs1.close()
+
+        // Reopen with same migration config: must NOT overwrite "new_app_token" with "legacy_v1"
+        val prefs2 = EncryptedDataStoreFactory.createPreferences(
+            context = storageCtx,
+            config = config,
+            migrations = listOf(
+                SharedPreferencesDataMigration(
+                    source = legacyPrefs,
+                    clearSourceOnSuccess = false,
+                    overwriteExisting = true,
+                    migrationId = "legacy_v1_import",
+                )
+            ),
+        )
+        assertEquals("new_app_token", prefs2.get(tokenKey))
+        prefs2.close()
+    }
+
+    @Test
     fun `forceResetAndClose wipes corrupted Android store under STRICT policy`() = runTest {
         val ctx = context()
         val storageCtx = PlatformStorageContext(ctx)

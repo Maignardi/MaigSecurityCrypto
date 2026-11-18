@@ -161,6 +161,19 @@ internal class JvmTinkKeyManager(
     override suspend fun resetAndRegenerate(reason: String): Long = mutex.withLock {
         check(tinkRegistered)
         val previousEpoch = cachedMetadata?.epoch ?: 0L
+        destroyKeyMaterialLocked()
+        val nextEpoch = (previousEpoch + 1L).coerceAtLeast(1L)
+        initializeFreshLocked(initialEpoch = nextEpoch)
+        nextEpoch
+    }
+
+    override suspend fun destroyKeyMaterial() {
+        mutex.withLock {
+            destroyKeyMaterialLocked()
+        }
+    }
+
+    private fun destroyKeyMaterialLocked() {
         context.fileSystem.delete(keysetPath, mustExist = false)
         context.fileSystem.delete(metadataPath, mustExist = false)
         context.fileSystem.delete(kekSaltOrSecretPath, mustExist = false)
@@ -168,10 +181,6 @@ internal class JvmTinkKeyManager(
         cachedHandle = null
         cachedAead = null
         cachedMetadata = null
-
-        val nextEpoch = (previousEpoch + 1L).coerceAtLeast(1L)
-        initializeFreshLocked(initialEpoch = nextEpoch)
-        nextEpoch
     }
 
     override suspend fun diagnostics(): SecurityDiagnostics = mutex.withLock {
@@ -251,25 +260,42 @@ internal class JvmTinkKeyManager(
     private fun loadExistingLocked() {
         val kekAead = deriveOrLoadKekAeadLocked(createIfMissing = false)
         val encryptedBytes = readBytes(keysetPath)
+        var migratedFromV012Aad = false
         val handle = try {
             TinkProtoKeysetFormat.parseEncryptedKeyset(
                 encryptedBytes,
                 kekAead,
                 keysetAssociatedData(),
             )
-        } catch (e: GeneralSecurityException) {
-            // Do NOT cache unvalidated KEK when unwrap fails (e.g., wrong passphrase).
-            throw KeyManagementException("Failed to decrypt keyset for '${config.storeName}'", e)
+        } catch (primaryError: GeneralSecurityException) {
+            // Backward compatibility: 0.1.2 briefly used "storeName:storeName" as JVM AAD.
+            try {
+                TinkProtoKeysetFormat.parseEncryptedKeyset(
+                    encryptedBytes,
+                    kekAead,
+                    legacyV012KeysetAssociatedData(),
+                ).also { migratedFromV012Aad = true }
+            } catch (_: GeneralSecurityException) {
+                // Do NOT cache unvalidated KEK when unwrap fails (e.g., wrong passphrase).
+                throw KeyManagementException(
+                    "Failed to decrypt keyset for '${config.storeName}'",
+                    primaryError,
+                )
+            }
         }
         val aead = handle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
         val meta = if (context.fileSystem.exists(metadataPath)) {
-            loadMetadataLocked(aead)
+            loadMetadataLocked(aead, allowV012Fallback = migratedFromV012Aad)
         } else {
             KeyRotationMetadata(
                 epoch = 1L,
                 createdAtEpochMs = System.currentTimeMillis(),
                 writesSinceRotation = 0L,
             ).also { persistMetadataLocked(aead, it) }
+        }
+        if (migratedFromV012Aad) {
+            persistKeysetWithKekLocked(kekAead, handle)
+            persistMetadataLocked(aead, meta)
         }
         cachedKekAead = kekAead
         cachedHandle = handle
@@ -353,15 +379,26 @@ internal class JvmTinkKeyManager(
         }
     }
 
-    private fun loadMetadataLocked(aead: Aead): KeyRotationMetadata {
+    private fun loadMetadataLocked(aead: Aead, allowV012Fallback: Boolean = false): KeyRotationMetadata {
         val encrypted = readBytes(metadataPath)
         val plain = try {
             aead.decrypt(encrypted, metadataAssociatedData())
         } catch (e: GeneralSecurityException) {
-            throw StoreTamperedOrCorruptedException(
-                "Key rotation metadata authentication failed for '${config.storeName}'",
-                e,
-            )
+            if (allowV012Fallback) {
+                try {
+                    aead.decrypt(encrypted, legacyV012MetadataAssociatedData())
+                } catch (e2: GeneralSecurityException) {
+                    throw StoreTamperedOrCorruptedException(
+                        "Key rotation metadata authentication failed for '${config.storeName}'",
+                        e2,
+                    )
+                }
+            } else {
+                throw StoreTamperedOrCorruptedException(
+                    "Key rotation metadata authentication failed for '${config.storeName}'",
+                    e,
+                )
+            }
         }
         return try {
             json.decodeFromString(KeyRotationMetadata.serializer(), plain.decodeToString())
@@ -480,13 +517,16 @@ internal class JvmTinkKeyManager(
     }
 
     private fun keysetAssociatedData(): ByteArray =
-        buildDomainAad(KEYSET_AAD_TAG, "${context.applicationContextOrName}:${config.storeName}")
+        buildDomainAad(KEYSET_AAD_TAG, config.storeName)
 
     private fun metadataAssociatedData(): ByteArray =
-        buildDomainAad(METADATA_AAD_TAG, "${context.applicationContextOrName}:${config.storeName}")
+        buildDomainAad(METADATA_AAD_TAG, config.storeName)
 
-    private val PlatformStorageContext.applicationContextOrName: String
-        get() = config.storeName
+    private fun legacyV012KeysetAssociatedData(): ByteArray =
+        buildDomainAad(KEYSET_AAD_TAG, "${config.storeName}:${config.storeName}")
+
+    private fun legacyV012MetadataAssociatedData(): ByteArray =
+        buildDomainAad(METADATA_AAD_TAG, "${config.storeName}:${config.storeName}")
 
     private fun buildDomainAad(domain: ByteArray, scope: String): ByteArray {
         val scopeBytes = scope.encodeToByteArray()

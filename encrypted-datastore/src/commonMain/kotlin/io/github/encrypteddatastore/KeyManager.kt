@@ -56,6 +56,11 @@ internal interface KeyManager {
      */
     suspend fun resetAndRegenerate(reason: String): Long
 
+    /**
+     * Destroys all underlying key material without creating new keys.
+     */
+    suspend fun destroyKeyMaterial()
+
     suspend fun diagnostics(): SecurityDiagnostics
 }
 

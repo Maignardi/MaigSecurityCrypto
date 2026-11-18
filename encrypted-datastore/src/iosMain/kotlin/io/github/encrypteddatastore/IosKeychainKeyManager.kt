@@ -83,14 +83,117 @@ internal data class IosKeychainKeysetRecord(
 )
 
 /**
- * iOS Keychain-backed [KeyManager] using Apple native `CommonCrypto` via `cryptography-provider-apple`
- * (`AES-256-CTR + HMAC-SHA256` Encrypt-then-MAC with domain-separated subkeys) and `ThisDeviceOnly`
- * Keychain items (`SecItem*`).
+ * Encrypt-then-MAC AEAD built on Apple `CommonCrypto` (`AES-256-CTR` + `HMAC-SHA256`)
+ * with domain-separated subkeys and length-prefixed AAD.
+ */
+internal object IosAesCtrHmacCipher {
+    const val IV_BYTES = 16
+    const val MAC_TAG_BYTES = 32
+    private val ENC_SUBKEY_LABEL = "EDST_IOS_CTR_ENC_V1".encodeToByteArray()
+    private val MAC_SUBKEY_LABEL = "EDST_IOS_HMAC_SHA256_V1".encodeToByteArray()
+
+    private val provider = CryptographyProvider.Default
+    private val aesCtr = provider.get(AES.CTR)
+    private val hmac = provider.get(HMAC)
+
+    suspend fun encrypt(
+        masterKey: ByteArray,
+        plaintext: ByteArray,
+        associatedData: ByteArray,
+        iv: ByteArray,
+    ): ByteArray {
+        require(iv.size == IV_BYTES) { "IV must be $IV_BYTES bytes" }
+        var encKeyBytes: ByteArray? = null
+        var macKeyBytes: ByteArray? = null
+        try {
+            val (derivedEnc, derivedMac) = deriveSubkeys(masterKey)
+            encKeyBytes = derivedEnc
+            macKeyBytes = derivedMac
+
+            val aesKey = aesCtr.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, derivedEnc)
+            val ct = aesKey.cipher().encryptWithIv(iv, plaintext)
+
+            val macInput = buildMacInput(associatedData, iv, ct)
+            val macKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, derivedMac)
+            val tag = macKey.signatureGenerator().generateSignature(macInput)
+
+            val payload = ByteArray(IV_BYTES + ct.size + tag.size)
+            iv.copyInto(payload, destinationOffset = 0)
+            ct.copyInto(payload, destinationOffset = IV_BYTES)
+            tag.copyInto(payload, destinationOffset = IV_BYTES + ct.size)
+            return payload
+        } finally {
+            encKeyBytes?.wipe()
+            macKeyBytes?.wipe()
+        }
+    }
+
+    suspend fun decrypt(
+        masterKey: ByteArray,
+        ciphertext: ByteArray,
+        associatedData: ByteArray,
+        storeName: String,
+        keyEpoch: Long,
+    ): ByteArray {
+        if (ciphertext.size < IV_BYTES + MAC_TAG_BYTES) {
+            throw StoreTamperedOrCorruptedException(
+                "iOS encrypted payload is truncated (${ciphertext.size} bytes)"
+            )
+        }
+        var encKeyBytes: ByteArray? = null
+        var macKeyBytes: ByteArray? = null
+        try {
+            val (derivedEnc, derivedMac) = deriveSubkeys(masterKey)
+            encKeyBytes = derivedEnc
+            macKeyBytes = derivedMac
+
+            val iv = ciphertext.copyOfRange(0, IV_BYTES)
+            val ctEnd = ciphertext.size - MAC_TAG_BYTES
+            val ct = ciphertext.copyOfRange(IV_BYTES, ctEnd)
+            val tag = ciphertext.copyOfRange(ctEnd, ciphertext.size)
+
+            val macInput = buildMacInput(associatedData, iv, ct)
+            val macKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, derivedMac)
+            val validTag = macKey.signatureVerifier().tryVerifySignature(macInput, tag)
+            if (!validTag) {
+                throw StoreTamperedOrCorruptedException(
+                    "iOS HMAC authentication failed for '$storeName' (epoch=$keyEpoch)"
+                )
+            }
+
+            val aesKey = aesCtr.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, derivedEnc)
+            return aesKey.cipher().decryptWithIv(iv, ct)
+        } finally {
+            encKeyBytes?.wipe()
+            macKeyBytes?.wipe()
+        }
+    }
+
+    private suspend fun deriveSubkeys(masterKey: ByteArray): Pair<ByteArray, ByteArray> {
+        val prfKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, masterKey)
+        val generator = prfKey.signatureGenerator()
+        val encKey = generator.generateSignature(ENC_SUBKEY_LABEL)
+        val macKey = generator.generateSignature(MAC_SUBKEY_LABEL)
+        return encKey to macKey
+    }
+
+    private fun buildMacInput(aad: ByteArray, iv: ByteArray, ct: ByteArray): ByteArray {
+        return Buffer().apply {
+            writeInt(aad.size)
+            write(aad)
+            write(iv)
+            write(ct)
+        }.readByteArray()
+    }
+}
+
+/**
+ * iOS Keychain-backed [KeyManager] using Apple native `CommonCrypto` via [IosAesCtrHmacCipher]
+ * and `ThisDeviceOnly` Keychain items (`SecItem*`).
  *
  * - Only [CipherAlgorithm.AES256_CTR_HMAC_SHA256] is supported on iOS.
- * - When [SecurityConfig.userAuthConfig] is set, Keychain items use `SecAccessControl` and a shared
- *   `LAContext` configured with `touchIDAuthenticationAllowableReuseDuration` matching
- *   `authValidityDurationSeconds`, and the DEK record is not cached in RAM across operations.
+ * - When [SecurityConfig.userAuthConfig] is set, Keychain items use `SecAccessControl` and an
+ *   expiring `LAContext` that is invalidated after `authValidityDurationSeconds`.
  */
 internal class IosKeychainKeyManager(
     private val context: PlatformStorageContext,
@@ -99,11 +202,8 @@ internal class IosKeychainKeyManager(
 
     private companion object {
         const val KEY_BYTES = 32
-        const val IV_BYTES = 16
-        const val MAC_TAG_BYTES = 32
         const val META_CHECKPOINT_INTERVAL = 10L
-        val ENC_SUBKEY_LABEL = "EDST_IOS_CTR_ENC_V1".encodeToByteArray()
-        val MAC_SUBKEY_LABEL = "EDST_IOS_HMAC_SHA256_V1".encodeToByteArray()
+        const val MAX_APPLE_TOUCH_ID_REUSE_SECONDS = 300
     }
 
     init {
@@ -117,18 +217,12 @@ internal class IosKeychainKeyManager(
 
     private val mutex = Mutex()
     private val json = Json { ignoreUnknownKeys = true }
-    private val provider = CryptographyProvider.Default
-    private val aesCtr = provider.get(AES.CTR)
-    private val hmac = provider.get(HMAC)
     private val serviceName = context.resolvedServiceName()
     private val accountName = "edst_dek_${config.storeName}"
     private val shouldCacheInMemory: Boolean = config.userAuthConfig == null
 
-    private val reusableLaContext: LAContext? = config.userAuthConfig?.let { auth ->
-        LAContext().apply {
-            touchIDAuthenticationAllowableReuseDuration = auth.authValidityDurationSeconds.toDouble()
-        }
-    }
+    private var currentLaContext: LAContext? = null
+    private var laContextCreatedAtMs: Long = 0L
 
     private var cachedRecord: IosKeychainKeysetRecord? = null
     private var inMemoryWritesSinceRotation: Long? = null
@@ -158,28 +252,11 @@ internal class IosKeychainKeyManager(
         val keyBase64 = record.epochKeysBase64[record.currentEpoch]
             ?: throw KeyManagementException("Missing DEK for epoch ${record.currentEpoch}")
         val masterKey = Base64.decode(keyBase64)
-        var encKeyBytes: ByteArray? = null
-        var macKeyBytes: ByteArray? = null
         try {
             val header = headerBuilder(CipherAlgorithm.AES256_CTR_HMAC_SHA256, record.currentEpoch)
             val aad = aadBuilder(header)
-
-            val (derivedEnc, derivedMac) = deriveSubkeys(masterKey)
-            encKeyBytes = derivedEnc
-            macKeyBytes = derivedMac
-
-            val iv = generateRandomBytes(IV_BYTES)
-            val aesKey = aesCtr.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, derivedEnc)
-            val ct = aesKey.cipher().encryptWithIv(iv, plaintext)
-
-            val macInput = buildMacInput(aad, iv, ct)
-            val macKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, derivedMac)
-            val tag = macKey.signatureGenerator().generateSignature(macInput)
-
-            val payload = ByteArray(IV_BYTES + ct.size + tag.size)
-            iv.copyInto(payload, destinationOffset = 0)
-            ct.copyInto(payload, destinationOffset = IV_BYTES)
-            tag.copyInto(payload, destinationOffset = IV_BYTES + ct.size)
+            val iv = generateRandomBytes(IosAesCtrHmacCipher.IV_BYTES)
+            val payload = IosAesCtrHmacCipher.encrypt(masterKey, plaintext, aad, iv)
 
             val nextWrites = (inMemoryWritesSinceRotation ?: record.writesSinceRotation) + 1L
             val updated = record.copy(writesSinceRotation = nextWrites)
@@ -201,8 +278,6 @@ internal class IosKeychainKeyManager(
             throw EncryptionException("iOS AEAD encryption failed for '${config.storeName}'", e)
         } finally {
             masterKey.wipe()
-            encKeyBytes?.wipe()
-            macKeyBytes?.wipe()
         }
     }
 
@@ -217,41 +292,20 @@ internal class IosKeychainKeyManager(
                 "Unsupported cipher algorithm $algorithm on iOS for '${config.storeName}'"
             )
         }
-        if (ciphertext.size < IV_BYTES + MAC_TAG_BYTES) {
-            throw StoreTamperedOrCorruptedException(
-                "iOS encrypted payload is truncated (${ciphertext.size} bytes)"
-            )
-        }
         val record = ensureInitializedLocked()
         val keyBase64 = record.epochKeysBase64[keyEpoch]
             ?: throw StoreTamperedOrCorruptedException(
                 "No retained DEK for epoch $keyEpoch in '${config.storeName}'"
             )
         val masterKey = Base64.decode(keyBase64)
-        var encKeyBytes: ByteArray? = null
-        var macKeyBytes: ByteArray? = null
         try {
-            val (derivedEnc, derivedMac) = deriveSubkeys(masterKey)
-            encKeyBytes = derivedEnc
-            macKeyBytes = derivedMac
-
-            val iv = ciphertext.copyOfRange(0, IV_BYTES)
-            val ctEnd = ciphertext.size - MAC_TAG_BYTES
-            val ct = ciphertext.copyOfRange(IV_BYTES, ctEnd)
-            val tag = ciphertext.copyOfRange(ctEnd, ciphertext.size)
-
-            // Encrypt-then-MAC: always verify HMAC-SHA256 before decrypting
-            val macInput = buildMacInput(associatedData, iv, ct)
-            val macKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, derivedMac)
-            val validTag = macKey.signatureVerifier().tryVerifySignature(macInput, tag)
-            if (!validTag) {
-                throw StoreTamperedOrCorruptedException(
-                    "iOS HMAC authentication failed for '${config.storeName}' (epoch=$keyEpoch)"
-                )
-            }
-
-            val aesKey = aesCtr.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, derivedEnc)
-            aesKey.cipher().decryptWithIv(iv, ct)
+            IosAesCtrHmacCipher.decrypt(
+                masterKey = masterKey,
+                ciphertext = ciphertext,
+                associatedData = associatedData,
+                storeName = config.storeName,
+                keyEpoch = keyEpoch,
+            )
         } catch (e: SecurityStorageException) {
             throw e
         } catch (e: Throwable) {
@@ -261,8 +315,6 @@ internal class IosKeychainKeyManager(
             )
         } finally {
             masterKey.wipe()
-            encKeyBytes?.wipe()
-            macKeyBytes?.wipe()
         }
     }
 
@@ -286,9 +338,7 @@ internal class IosKeychainKeyManager(
 
     override suspend fun resetAndRegenerate(reason: String): Long = mutex.withLock {
         val prevEpoch = cachedRecord?.currentEpoch ?: lastKnownEpoch
-        deleteFromKeychain()
-        cachedRecord = null
-        inMemoryWritesSinceRotation = 0L
+        destroyKeyMaterialLocked()
         val freshEpoch = (prevEpoch + 1L).coerceAtLeast(1L)
         val freshRecord = createFreshRecord(freshEpoch)
         saveRecordToKeychain(freshRecord)
@@ -297,6 +347,12 @@ internal class IosKeychainKeyManager(
             cachedRecord = freshRecord
         }
         freshEpoch
+    }
+
+    override suspend fun destroyKeyMaterial() {
+        mutex.withLock {
+            destroyKeyMaterialLocked()
+        }
     }
 
     override suspend fun diagnostics(): SecurityDiagnostics = mutex.withLock {
@@ -313,21 +369,35 @@ internal class IosKeychainKeyManager(
         )
     }
 
-    private suspend fun deriveSubkeys(masterKey: ByteArray): Pair<ByteArray, ByteArray> {
-        val prfKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, masterKey)
-        val generator = prfKey.signatureGenerator()
-        val encKey = generator.generateSignature(ENC_SUBKEY_LABEL)
-        val macKey = generator.generateSignature(MAC_SUBKEY_LABEL)
-        return encKey to macKey
+    private fun destroyKeyMaterialLocked() {
+        deleteFromKeychain()
+        invalidateAuthContextLocked()
+        cachedRecord = null
+        inMemoryWritesSinceRotation = null
     }
 
-    private fun buildMacInput(aad: ByteArray, iv: ByteArray, ct: ByteArray): ByteArray {
-        return Buffer().apply {
-            writeInt(aad.size)
-            write(aad)
-            write(iv)
-            write(ct)
-        }.readByteArray()
+    private fun activeAuthContextLocked(): LAContext? {
+        val auth = config.userAuthConfig ?: return null
+        val now = currentTimeMillis()
+        val validityMs = auth.authValidityDurationSeconds * 1000L
+        val existing = currentLaContext
+        if (existing == null || (now - laContextCreatedAtMs) >= validityMs) {
+            existing?.invalidate()
+            val fresh = LAContext().apply {
+                touchIDAuthenticationAllowableReuseDuration =
+                    auth.authValidityDurationSeconds.coerceAtMost(MAX_APPLE_TOUCH_ID_REUSE_SECONDS).toDouble()
+            }
+            currentLaContext = fresh
+            laContextCreatedAtMs = now
+            return fresh
+        }
+        return existing
+    }
+
+    private fun invalidateAuthContextLocked() {
+        currentLaContext?.invalidate()
+        currentLaContext = null
+        laContextCreatedAtMs = 0L
     }
 
     private fun shouldPersistMetadataWrite(policy: KeyRotationPolicy, writes: Long): Boolean {
@@ -521,10 +591,12 @@ internal class IosKeychainKeyManager(
                 data.toByteArray()
             }
             errSecItemNotFound -> null
-            errSecAuthFailed, errSecInteractionNotAllowed, errSecUserCanceled ->
+            errSecAuthFailed, errSecInteractionNotAllowed, errSecUserCanceled -> {
+                invalidateAuthContextLocked()
                 throw UserAuthenticationRequiredException(
                     "iOS Keychain authentication required or cancelled (OSStatus=$status)"
                 )
+            }
             else -> throw KeystoreUnavailableException("Keychain read failed with OSStatus=$status")
         }
     }
@@ -570,10 +642,12 @@ internal class IosKeychainKeyManager(
 
         when (status) {
             errSecSuccess -> Unit
-            errSecAuthFailed, errSecInteractionNotAllowed, errSecUserCanceled ->
+            errSecAuthFailed, errSecInteractionNotAllowed, errSecUserCanceled -> {
+                invalidateAuthContextLocked()
                 throw UserAuthenticationRequiredException(
                     "iOS Keychain authentication required or cancelled on write (OSStatus=$status)"
                 )
+            }
             else -> throw KeystoreUnavailableException("Keychain write failed with OSStatus=$status")
         }
     }
@@ -599,10 +673,12 @@ internal class IosKeychainKeyManager(
         CFDictionaryAddValue(dict, kSecClass, kSecClassGenericPassword)
         CFDictionaryAddValue(dict, kSecAttrService, serviceRef)
         CFDictionaryAddValue(dict, kSecAttrAccount, accountRef)
-        if (includeAuthContext && reusableLaContext != null) {
-            val ctxRef = CFBridgingRetain(reusableLaContext)
-            CFDictionaryAddValue(dict, kSecUseAuthenticationContext, ctxRef)
-            if (ctxRef != null) CFRelease(ctxRef)
+        if (includeAuthContext) {
+            activeAuthContextLocked()?.let { ctx ->
+                val ctxRef = CFBridgingRetain(ctx)
+                CFDictionaryAddValue(dict, kSecUseAuthenticationContext, ctxRef)
+                if (ctxRef != null) CFRelease(ctxRef)
+            }
         }
         if (serviceRef != null) CFRelease(serviceRef)
         if (accountRef != null) CFRelease(accountRef)

@@ -23,9 +23,11 @@ public class SharedPreferencesDataMigration(
     private val keysToMigrate: Set<String>? = null,
     private val clearSourceOnSuccess: Boolean = true,
     private val overwriteExisting: Boolean = false,
+    private val migrationId: String = "shared_prefs_default",
 ) : EncryptedPreferencesMigration {
 
     override suspend fun shouldMigrate(snapshot: EncryptedPreferencesSnapshot): Boolean {
+        if (snapshot.hasCompletedMigration(migrationId)) return false
         val entries = withContext(Dispatchers.IO) { source.all }
         if (entries.isEmpty()) return false
         return entries.keys.any { key ->
@@ -53,6 +55,7 @@ public class SharedPreferencesDataMigration(
                 }
             }
         }
+        mutable.markMigrationCompleted(migrationId)
     }
 
     override suspend fun cleanUp() {

@@ -68,7 +68,7 @@ dependencyResolutionManagement {
 **Android app/library (`app/build.gradle.kts`):**
 ```kotlin
 dependencies {
-    implementation("com.github.Maignardi:encrypted-datastore:0.1.2")
+    implementation("com.github.Maignardi:encrypted-datastore:0.2.0")
 }
 ```
 
@@ -78,7 +78,7 @@ dependencies {
 
 ```toml
 [versions]
-encryptedDatastore = "0.1.2"
+encryptedDatastore = "0.2.0"
 
 [libraries]
 encrypted-datastore = { module = "com.github.Maignardi:encrypted-datastore", version.ref = "encryptedDatastore" }
@@ -108,7 +108,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.maignardi:encrypted-datastore:0.1.2")
+    implementation("io.github.maignardi:encrypted-datastore:0.2.0")
 }
 ```
 
@@ -408,11 +408,11 @@ VaultRepository(
 1. Push changes to `Maignardi/encrypted-datastore`.
 2. Create and push a version tag:
    ```bash
-   git tag 0.1.2
-   git push origin 0.1.2
+   git tag 0.2.0
+   git push origin 0.2.0
    ```
-3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.1.2")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
-4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.1.2`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
+3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.2.0")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
+4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.2.0`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
 
 ---
 

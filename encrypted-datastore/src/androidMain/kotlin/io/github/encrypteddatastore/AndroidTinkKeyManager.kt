@@ -165,11 +165,16 @@ internal class AndroidTinkKeyManager(
         check(tinkRegistered)
         val previousEpoch = cachedMetadata?.epoch ?: 0L
         val nextEpoch = (previousEpoch + 1L).coerceAtLeast(1L)
-
-        // Generate fresh keyset & KEK before wiping old files unless deletion is required for alias recreation.
+        // Wipe existing key files and hardware master key, then initialize a fresh keyset/KEK.
         wipeAllKeyFilesLocked()
         val created = initializeFreshWithPolicyLocked(initialEpoch = nextEpoch)
         created.meta.epoch
+    }
+
+    override suspend fun destroyKeyMaterial() {
+        mutex.withLock {
+            wipeAllKeyFilesLocked()
+        }
     }
 
     override suspend fun diagnostics(): SecurityDiagnostics = mutex.withLock {
@@ -521,7 +526,7 @@ internal class AndroidTinkKeyManager(
 
         val renamedWithOs = runCatching {
             Os.rename(tmp.absolutePath, target.absolutePath)
-            true
+            target.exists() && !tmp.exists()
         }.getOrDefault(false)
 
         if (!renamedWithOs) {

@@ -27,6 +27,12 @@ android {
     testOptions {
         unitTests.isIncludeAndroidResources = true
     }
+
+    lint {
+        checkDependencies = true
+        abortOnError = true
+        error += "NewApi"
+    }
 }
 
 dependencies {
