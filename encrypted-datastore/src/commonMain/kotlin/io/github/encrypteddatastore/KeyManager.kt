@@ -22,12 +22,13 @@ internal interface KeyManager {
     suspend fun writesSinceRotation(): Long
 
     /**
-     * Atomically builds the envelope header from the active algorithm and epoch,
-     * computes associated data via [aadBuilder], encrypts [plaintext], and returns
-     * the complete serialized envelope bytes.
+     * Checks [rotationPolicy] if needed, atomically builds the envelope header from the active
+     * algorithm and epoch, computes associated data via [aadBuilder], encrypts [plaintext],
+     * and returns the complete serialized envelope bytes.
      */
     suspend fun encryptEnvelope(
         plaintext: ByteArray,
+        rotationPolicy: KeyRotationPolicy,
         headerBuilder: (CipherAlgorithm, Long) -> ByteArray,
         aadBuilder: (ByteArray) -> ByteArray,
     ): EncryptedEnvelopeResult
@@ -38,12 +39,6 @@ internal interface KeyManager {
         keyEpoch: Long,
         associatedData: ByteArray,
     ): ByteArray
-
-    /**
-     * Checks [KeyRotationPolicy] and rotates the primary key if needed.
-     * Returns the resulting active epoch.
-     */
-    suspend fun rotateIfPolicyRequires(policy: KeyRotationPolicy): Long
 
     /**
      * Unconditionally promotes a new primary key, increments the key epoch, and trims retained
@@ -85,3 +80,5 @@ internal expect fun enforceRestrictiveFilePermissions(
 )
 
 internal expect fun defaultIoCoroutineScope(): CoroutineScope
+
+internal expect fun defaultCipherAlgorithm(): CipherAlgorithm

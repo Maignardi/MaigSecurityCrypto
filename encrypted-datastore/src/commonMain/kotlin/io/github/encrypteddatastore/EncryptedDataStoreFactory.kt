@@ -94,14 +94,30 @@ public object EncryptedDataStoreFactory {
         context: PlatformStorageContext,
         config: SecurityConfig,
         json: Json = defaultJson,
+        migrations: List<EncryptedPreferencesMigration> = emptyList(),
         scope: CoroutineScope = defaultIoCoroutineScope(),
     ): EncryptedPreferences {
+        val dataMigrations = migrations.map { prefMigration ->
+            object : DataMigration<EncryptedPreferencesState> {
+                override suspend fun shouldMigrate(currentData: EncryptedPreferencesState): Boolean =
+                    prefMigration.shouldMigrate(EncryptedPreferencesSnapshot(currentData.entries, json))
+
+                override suspend fun migrate(currentData: EncryptedPreferencesState): EncryptedPreferencesState {
+                    val mutable = MutableEncryptedPreferences(currentData.entries, json)
+                    prefMigration.migrate(mutable)
+                    return mutable.toState()
+                }
+
+                override suspend fun cleanUp() = prefMigration.cleanUp()
+            }
+        }
         val store = create(
             context = context,
             config = config,
             serializer = EncryptedPreferencesState.serializer(),
             defaultValue = { EncryptedPreferencesState() },
             json = json,
+            migrations = dataMigrations,
             scope = scope,
         )
         return EncryptedPreferences(store = store, json = json)

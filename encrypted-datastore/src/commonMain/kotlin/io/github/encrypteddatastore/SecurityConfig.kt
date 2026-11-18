@@ -14,9 +14,15 @@ public enum class CipherAlgorithm(public val id: Byte) {
 
     /**
      * XChaCha20-Poly1305 with a 192-bit extended nonce. Safe against random-nonce collisions
-     * even under high write volumes without hardware AES requirements.
+     * even under high write volumes without hardware AES requirements (Android & JVM).
      */
     XCHACHA20_POLY1305(2),
+
+    /**
+     * AES-256-CTR + HMAC-SHA256 Encrypt-then-MAC AEAD. Default on iOS (backed by Apple
+     * CommonCrypto) and supported across Android, JVM, and iOS.
+     */
+    AES256_CTR_HMAC_SHA256(3),
     ;
 
     public companion object {
@@ -185,7 +191,7 @@ public data class SecurityDiagnostics(
  */
 public class SecurityConfig(
     public val storeName: String,
-    public val algorithm: CipherAlgorithm = CipherAlgorithm.AES256_GCM,
+    public val algorithm: CipherAlgorithm = defaultCipherAlgorithm(),
     public val keyRotationPolicy: KeyRotationPolicy = KeyRotationPolicy.Automatic(),
     public val recoveryPolicy: KeystoreRecoveryPolicy = KeystoreRecoveryPolicy.STRICT,
     public val preferStrongBox: Boolean = true,

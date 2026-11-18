@@ -1,5 +1,7 @@
 package io.github.encrypteddatastore
 
+import android.system.Os
+import android.system.OsConstants
 import com.google.crypto.tink.Aead
 import com.google.crypto.tink.KeyTemplates
 import com.google.crypto.tink.KeysetHandle
@@ -15,12 +17,6 @@ import kotlinx.serialization.json.Json
 import okio.Buffer
 import java.io.File
 import java.io.FileOutputStream
-import java.nio.channels.FileChannel
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
-import java.nio.file.attribute.PosixFilePermissions
 import java.security.GeneralSecurityException
 import java.security.SecureRandom
 import kotlin.time.DurationUnit
@@ -34,10 +30,10 @@ internal data class AndroidKeyRotationMetadata(
 
 /**
  * Android KeyManager combining Google Tink DEK keysets with an [AndroidKeyStoreAead] KEK
- * stored in `noBackupFilesDir` with atomic writes, 0600 permissions, key rotation, and explicit
- * OEM Keystore failure policies.
+ * stored in `noBackupFilesDir` with API 23+-compatible atomic writes (`android.system.Os`),
+ * 0600 permissions, key rotation, and explicit OEM Keystore failure policies.
  *
- * Note: When [SecurityConfig.userAuthConfig] is configured, the DEK keyset is NOT cached in RAM
+ * When [SecurityConfig.userAuthConfig] is configured, the DEK keyset is NOT cached in RAM
  * across operations so AndroidKeyStore's authentication validity timeout is enforced on each access.
  */
 internal class AndroidTinkKeyManager(
@@ -53,6 +49,7 @@ internal class AndroidTinkKeyManager(
         private val KEYSET_AAD_TAG = "EDST_ANDROID_KEYSET_V1".encodeToByteArray()
         private val METADATA_AAD_TAG = "EDST_ANDROID_META_V1".encodeToByteArray()
         private const val SOFTWARE_SECRET_BYTES = 32
+        private const val META_CHECKPOINT_INTERVAL = 10L
     }
 
     private val mutex = Mutex()
@@ -72,6 +69,7 @@ internal class AndroidTinkKeyManager(
     private var cachedAead: Aead? = null
     private var cachedMetadata: AndroidKeyRotationMetadata? = null
     private var currentSecurityLevel: SecurityLevel = SecurityLevel.UNKNOWN
+    private var inMemoryWritesSinceRotation: Long? = null
 
     private data class UnlockedState(
         val kek: Aead,
@@ -90,15 +88,18 @@ internal class AndroidTinkKeyManager(
     }
 
     override suspend fun writesSinceRotation(): Long = mutex.withLock {
-        obtainUnlockedStateLocked().meta.writesSinceRotation
+        val state = obtainUnlockedStateLocked()
+        inMemoryWritesSinceRotation ?: state.meta.writesSinceRotation
     }
 
     override suspend fun encryptEnvelope(
         plaintext: ByteArray,
+        rotationPolicy: KeyRotationPolicy,
         headerBuilder: (CipherAlgorithm, Long) -> ByteArray,
         aadBuilder: (ByteArray) -> ByteArray,
     ): EncryptedEnvelopeResult = mutex.withLock {
-        val state = obtainUnlockedStateLocked()
+        var state = obtainUnlockedStateLocked()
+        state = rotateIfPolicyRequiresLocked(state, rotationPolicy)
         val header = headerBuilder(config.algorithm, state.meta.epoch)
         val aad = aadBuilder(header)
         val ciphertext = try {
@@ -106,10 +107,12 @@ internal class AndroidTinkKeyManager(
         } catch (e: GeneralSecurityException) {
             throw EncryptionException("AEAD encryption failed for '${config.storeName}'", e)
         }
-        val updatedMeta = state.meta.copy(writesSinceRotation = state.meta.writesSinceRotation + 1L)
-        if (config.keyRotationPolicy is KeyRotationPolicy.Automatic) {
+        val nextWrites = (inMemoryWritesSinceRotation ?: state.meta.writesSinceRotation) + 1L
+        val updatedMeta = state.meta.copy(writesSinceRotation = nextWrites)
+        if (shouldPersistMetadataWrite(rotationPolicy, nextWrites)) {
             persistMetadataLocked(state.aead, updatedMeta)
         }
+        inMemoryWritesSinceRotation = nextWrites
         cachedMetadata = updatedMeta
         EncryptedEnvelopeResult(
             keyEpoch = state.meta.epoch,
@@ -134,27 +137,9 @@ internal class AndroidTinkKeyManager(
         }
     }
 
-    override suspend fun rotateIfPolicyRequires(policy: KeyRotationPolicy): Long = mutex.withLock {
-        val state = obtainUnlockedStateLocked()
-        if (policy is KeyRotationPolicy.Automatic) {
-            val nowMs = System.currentTimeMillis()
-            val ageMs = (nowMs - state.meta.createdAtEpochMs).coerceAtLeast(0L)
-            val maxAgeMs = policy.maxKeyAge.toLong(DurationUnit.MILLISECONDS)
-            val trigger = when {
-                state.meta.writesSinceRotation >= policy.maxWritesBeforeRotation -> "write_limit"
-                ageMs >= maxAgeMs -> "max_age"
-                else -> null
-            }
-            if (trigger != null) {
-                return@withLock rotateKeyLocked(state, policy.maxRetainedKeys.coerceAtLeast(2), trigger)
-            }
-        }
-        state.meta.epoch
-    }
-
     override suspend fun rotateKey(maxRetainedKeys: Int, trigger: String): Long = mutex.withLock {
         val state = obtainUnlockedStateLocked()
-        rotateKeyLocked(state, maxRetainedKeys.coerceAtLeast(2), trigger)
+        rotateKeyLocked(state, maxRetainedKeys.coerceAtLeast(2), trigger).meta.epoch
     }
 
     override suspend fun pruneHistoricalKeys() {
@@ -179,24 +164,54 @@ internal class AndroidTinkKeyManager(
     override suspend fun resetAndRegenerate(reason: String): Long = mutex.withLock {
         check(tinkRegistered)
         val previousEpoch = cachedMetadata?.epoch ?: 0L
-        wipeAllKeyFilesLocked()
         val nextEpoch = (previousEpoch + 1L).coerceAtLeast(1L)
+
+        // Generate fresh keyset & KEK before wiping old files unless deletion is required for alias recreation.
+        wipeAllKeyFilesLocked()
         val created = initializeFreshWithPolicyLocked(initialEpoch = nextEpoch)
         created.meta.epoch
     }
 
     override suspend fun diagnostics(): SecurityDiagnostics = mutex.withLock {
         val state = obtainUnlockedStateLocked()
+        val writes = inMemoryWritesSinceRotation ?: state.meta.writesSinceRotation
         SecurityDiagnostics(
             storeName = config.storeName,
             algorithm = config.algorithm,
             securityLevel = state.level,
             currentKeyEpoch = state.meta.epoch,
             keyCreatedAtEpochMs = state.meta.createdAtEpochMs,
-            writesSinceRotation = state.meta.writesSinceRotation,
+            writesSinceRotation = writes,
             hardwareBacked = state.level == SecurityLevel.STRONGBOX ||
                 state.level == SecurityLevel.HARDWARE_TEE,
         )
+    }
+
+    private fun shouldPersistMetadataWrite(policy: KeyRotationPolicy, writes: Long): Boolean {
+        if (policy !is KeyRotationPolicy.Automatic) return false
+        return policy.maxWritesBeforeRotation < META_CHECKPOINT_INTERVAL * 2 ||
+            writes % META_CHECKPOINT_INTERVAL == 0L
+    }
+
+    private fun rotateIfPolicyRequiresLocked(
+        state: UnlockedState,
+        policy: KeyRotationPolicy,
+    ): UnlockedState {
+        if (policy !is KeyRotationPolicy.Automatic) return state
+        val nowMs = System.currentTimeMillis()
+        val ageMs = (nowMs - state.meta.createdAtEpochMs).coerceAtLeast(0L)
+        val maxAgeMs = policy.maxKeyAge.toLong(DurationUnit.MILLISECONDS)
+        val writes = inMemoryWritesSinceRotation ?: state.meta.writesSinceRotation
+        val trigger = when {
+            writes >= policy.maxWritesBeforeRotation -> "write_limit"
+            ageMs >= maxAgeMs -> "max_age"
+            else -> null
+        }
+        return if (trigger != null) {
+            rotateKeyLocked(state, policy.maxRetainedKeys.coerceAtLeast(2), trigger)
+        } else {
+            state
+        }
     }
 
     private fun obtainUnlockedStateLocked(): UnlockedState {
@@ -244,7 +259,6 @@ internal class AndroidTinkKeyManager(
     }
 
     private fun loadExistingWithPolicyLocked(): UnlockedState {
-        // Software fallback is only allowed if explicitly enabled AND userAuthConfig is null.
         if (softwareSecretFile.exists()) {
             if (config.recoveryPolicy != KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK ||
                 config.userAuthConfig != null
@@ -257,28 +271,8 @@ internal class AndroidTinkKeyManager(
             return loadKeysetWithKekLocked(swKek, SecurityLevel.SOFTWARE_FALLBACK)
         }
 
-        return try {
-            val level = hardwareKekAead.ensureKeyAndGetSecurityLevel()
-            loadKeysetWithKekLocked(hardwareKekAead, level)
-        } catch (auth: UserAuthenticationRequiredException) {
-            throw auth
-        } catch (unavailable: KeystoreUnavailableException) {
-            // Note: Do NOT delete DataStore's .edst file here or wipe silently.
-            // If EXPLICIT_SOFTWARE_FALLBACK is opted in without userAuthConfig AND the hardware
-            // Keystore itself failed (no valid hardware keyset unwrap possible), allow fallback only
-            // when AndroidKeyStore cannot operate; otherwise fail closed or let CLEAR_AND_REGENERATE
-            // handle it once via EncryptedOkioSerializer.
-            if (config.recoveryPolicy == KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK &&
-                config.userAuthConfig == null
-            ) {
-                throw KeystoreUnavailableException(
-                    "Hardware Keystore failed for existing store '${config.storeName}'. " +
-                        "Use CLEAR_AND_REGENERATE to reset or resolve Keystore lock.",
-                    unavailable,
-                )
-            }
-            throw unavailable
-        }
+        val level = hardwareKekAead.ensureKeyAndGetSecurityLevel()
+        return loadKeysetWithKekLocked(hardwareKekAead, level)
     }
 
     private fun activateSoftwareFallbackAndCreateLocked(reason: String, initialEpoch: Long): UnlockedState {
@@ -311,6 +305,7 @@ internal class AndroidTinkKeyManager(
         persistKeysetLocked(kek, handle)
         persistMetadataLocked(aead, meta)
         cachedMetadata = meta
+        inMemoryWritesSinceRotation = 0L
         currentSecurityLevel = level
         if (shouldCacheDekInMemory) {
             activeKekAead = kek
@@ -352,17 +347,24 @@ internal class AndroidTinkKeyManager(
                 writesSinceRotation = 0L,
             ).also { persistMetadataLocked(aead, it) }
         }
-        cachedMetadata = meta
+        val syncedWrites = inMemoryWritesSinceRotation ?: meta.writesSinceRotation
+        val syncedMeta = meta.copy(writesSinceRotation = syncedWrites)
+        cachedMetadata = syncedMeta
+        inMemoryWritesSinceRotation = syncedWrites
         currentSecurityLevel = level
         if (shouldCacheDekInMemory) {
             activeKekAead = kek
             cachedHandle = handle
             cachedAead = aead
         }
-        return UnlockedState(kek, handle, aead, meta, level)
+        return UnlockedState(kek, handle, aead, syncedMeta, level)
     }
 
-    private fun rotateKeyLocked(state: UnlockedState, maxRetainedKeys: Int, trigger: String): Long {
+    private fun rotateKeyLocked(
+        state: UnlockedState,
+        maxRetainedKeys: Int,
+        trigger: String,
+    ): UnlockedState {
         val builder = KeysetHandle.newBuilder(state.handle)
         val newEntry = KeysetHandle.generateEntryFromParametersName(tinkParameterName(config.algorithm))
             .withRandomId()
@@ -395,6 +397,7 @@ internal class AndroidTinkKeyManager(
         persistKeysetLocked(state.kek, provisional)
         persistMetadataLocked(newAead, newMeta)
         cachedMetadata = newMeta
+        inMemoryWritesSinceRotation = 0L
         if (shouldCacheDekInMemory) {
             cachedHandle = provisional
             cachedAead = newAead
@@ -407,7 +410,7 @@ internal class AndroidTinkKeyManager(
                 trigger = trigger,
             )
         )
-        return newEpoch
+        return UnlockedState(state.kek, provisional, newAead, newMeta, state.level)
     }
 
     private fun wipeAllKeyFilesLocked() {
@@ -419,6 +422,7 @@ internal class AndroidTinkKeyManager(
         cachedHandle = null
         cachedAead = null
         cachedMetadata = null
+        inMemoryWritesSinceRotation = null
         currentSecurityLevel = SecurityLevel.UNKNOWN
     }
 
@@ -484,39 +488,64 @@ internal class AndroidTinkKeyManager(
         }
     }
 
+    /**
+     * API 23+-compatible atomic file write using `android.system.Os` (`open`/`chmod`/`rename`/`fsync`)
+     * with safe fallback for host Robolectric environments. Never uses `java.nio.file.*` (API 26+).
+     */
     private fun atomicWriteFile(target: File, bytes: ByteArray) {
         val tmp = File(target.parentFile, "${target.name}.tmp")
-        val tmpPath = tmp.toPath()
-        val targetPath = target.toPath()
         if (tmp.exists()) {
             tmp.delete()
         }
-        try {
-            val perms = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
-            Files.createFile(tmpPath, perms)
-        } catch (_: UnsupportedOperationException) {
+
+        val createdWithOs = runCatching {
+            val fd = Os.open(
+                tmp.absolutePath,
+                OsConstants.O_CREAT or OsConstants.O_WRONLY or OsConstants.O_TRUNC,
+                0b110_000_000, // 0600 before writing any bytes
+            )
+            Os.close(fd)
+            true
+        }.getOrDefault(false)
+
+        if (!createdWithOs) {
             tmp.createNewFile()
             enforceFilePermissions(tmp)
         }
+
         FileOutputStream(tmp).use { fos ->
             fos.write(bytes)
             fos.flush()
             fos.fd.sync()
         }
-        try {
-            Files.move(tmpPath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(tmpPath, targetPath, StandardCopyOption.REPLACE_EXISTING)
+
+        val renamedWithOs = runCatching {
+            Os.rename(tmp.absolutePath, target.absolutePath)
+            true
+        }.getOrDefault(false)
+
+        if (!renamedWithOs) {
+            check(tmp.renameTo(target)) {
+                "Failed to atomically move ${tmp.name} to ${target.name}"
+            }
         }
         enforceFilePermissions(target)
+
+        // Best-effort directory fsync (API 21+ Os.open on directory)
         runCatching {
-            target.parentFile?.toPath()?.let { dirPath ->
-                FileChannel.open(dirPath, StandardOpenOption.READ).use { it.force(true) }
+            target.parentFile?.let { dir ->
+                val dirFd = Os.open(dir.absolutePath, OsConstants.O_RDONLY, 0)
+                try {
+                    Os.fsync(dirFd)
+                } finally {
+                    Os.close(dirFd)
+                }
             }
         }
     }
 
     private fun enforceFilePermissions(file: File) {
+        runCatching { Os.chmod(file.absolutePath, 0b110_000_000) }
         file.setReadable(false, false)
         file.setReadable(true, true)
         file.setWritable(false, false)
@@ -543,5 +572,6 @@ internal class AndroidTinkKeyManager(
     private fun tinkParameterName(algorithm: CipherAlgorithm): String = when (algorithm) {
         CipherAlgorithm.AES256_GCM -> "AES256_GCM"
         CipherAlgorithm.XCHACHA20_POLY1305 -> "XCHACHA20_POLY1305"
+        CipherAlgorithm.AES256_CTR_HMAC_SHA256 -> "AES256_CTR_HMAC_SHA256"
     }
 }

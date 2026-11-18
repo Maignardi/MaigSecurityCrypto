@@ -36,7 +36,7 @@ internal class EncryptedOkioSerializer<T>(
     override suspend fun readFrom(source: BufferedSource): EncryptedBox<T> {
         val rawBytes = source.readByteArray()
         if (rawBytes.isEmpty()) {
-            return handleReadFailure(
+            return handleCorruptionFailure(
                 StoreTamperedOrCorruptedException(
                     "Encrypted store '${config.storeName}' is empty (possible truncation)."
                 )
@@ -64,23 +64,24 @@ internal class EncryptedOkioSerializer<T>(
                 plaintext.wipe()
             }
         } catch (authRequired: UserAuthenticationRequiredException) {
-            // Never wipe or treat locked device / missing biometric auth as corruption.
+            // Never wipe or treat locked device / cancelled biometric prompt as corruption.
             throw authRequired
+        } catch (unavailable: KeystoreUnavailableException) {
+            // Transient Keystore/Keychain outages must fail closed, never wipe user data.
+            throw unavailable
         } catch (tampered: StoreTamperedOrCorruptedException) {
-            handleReadFailure(tampered)
+            handleCorruptionFailure(tampered)
         } catch (invalidated: KeyPermanentlyInvalidatedException) {
-            handleReadFailure(invalidated)
+            handleCorruptionFailure(invalidated)
         } catch (decryptError: DecryptionException) {
-            handleReadFailure(decryptError)
+            handleCorruptionFailure(decryptError)
+        } catch (keyError: KeyManagementException) {
+            // Wrong passphrase or key management errors must never trigger automatic wipe.
+            throw keyError
+        } catch (securityError: SecurityStorageException) {
+            throw securityError
         } catch (e: Exception) {
-            if (e is SecurityStorageException) {
-                if (config.recoveryPolicy == KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE) {
-                    handleReadFailure(e)
-                } else {
-                    throw e
-                }
-            }
-            handleReadFailure(
+            handleCorruptionFailure(
                 StoreTamperedOrCorruptedException(
                     "Failed to decode encrypted store '${config.storeName}'",
                     e,
@@ -95,6 +96,7 @@ internal class EncryptedOkioSerializer<T>(
             val userAad = config.associatedDataProvider?.invoke()
             val result = keyManager.encryptEnvelope(
                 plaintext = jsonBytes,
+                rotationPolicy = config.keyRotationPolicy,
                 headerBuilder = { alg, epoch ->
                     EncryptedEnvelopeCodec.buildHeader(alg, epoch)
                 },
@@ -113,7 +115,7 @@ internal class EncryptedOkioSerializer<T>(
         }
     }
 
-    private suspend fun handleReadFailure(error: SecurityStorageException): Nothing {
+    private suspend fun handleCorruptionFailure(error: SecurityStorageException): Nothing {
         when (config.recoveryPolicy) {
             KeystoreRecoveryPolicy.STRICT,
             KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK -> throw error

@@ -209,4 +209,73 @@ class AndroidEncryptedDataStoreTest {
         assertTrue(a1 != a2)
         assertTrue(a1 != a3)
     }
+
+    @Test
+    @Config(sdk = [23])
+    fun `writes and rotates cleanly on Android API 23 without java nio API 26 calls`() = runTest {
+        val ctx = context()
+        val prefs = EncryptedDataStoreFactory.createPreferences(
+            context = PlatformStorageContext(ctx),
+            config = SecurityConfig(
+                storeName = "api23_compat",
+                recoveryPolicy = KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK,
+            ),
+        )
+        val key = PreferenceKeys.string("k23")
+        prefs.edit { it[key] = "hello_api23" }
+        assertEquals(2L, prefs.rotateKeys())
+        assertEquals("hello_api23", prefs.get(key))
+        prefs.close()
+    }
+
+    @Test
+    fun `SharedPreferencesDataMigration runs automatically before first read`() = runTest {
+        val ctx = context()
+        val legacyPrefs = ctx.getSharedPreferences("auto_data_migration_legacy", Context.MODE_PRIVATE)
+        legacyPrefs.edit()
+            .putString("session_jwt", "auto_migrated_jwt")
+            .putBoolean("remember_me", true)
+            .commit()
+
+        val prefs = EncryptedDataStoreFactory.createPreferences(
+            context = PlatformStorageContext(ctx),
+            config = SecurityConfig(
+                storeName = "auto_data_migration_target",
+                recoveryPolicy = KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK,
+            ),
+            migrations = listOf(SharedPreferencesDataMigration(source = legacyPrefs)),
+        )
+
+        // First read must already contain migrated values without any manual migration call
+        assertEquals("auto_migrated_jwt", prefs.get(PreferenceKeys.string("session_jwt")))
+        assertEquals(true, prefs.get(PreferenceKeys.boolean("remember_me")))
+        assertTrue(legacyPrefs.all.isEmpty())
+        prefs.close()
+    }
+
+    @Test
+    fun `forceResetAndClose wipes corrupted Android store under STRICT policy`() = runTest {
+        val ctx = context()
+        val storageCtx = PlatformStorageContext(ctx)
+        val config = SecurityConfig(
+            storeName = "android_force_reset",
+            recoveryPolicy = KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK,
+        )
+        val prefs = EncryptedDataStoreFactory.createPreferences(context = storageCtx, config = config)
+        prefs.edit { it[PreferenceKeys.string("k")] = "v" }
+        prefs.close()
+
+        val (_, storePath) = resolveEncryptedStoreFile(storageCtx, config)
+        File(storePath.toString()).writeBytes("tampered_data".encodeToByteArray())
+
+        val broken = EncryptedDataStoreFactory.createPreferences(context = storageCtx, config = config)
+        assertFailsWith<StoreTamperedOrCorruptedException> {
+            broken.get(PreferenceKeys.string("k"))
+        }
+        broken.forceResetAndClose()
+
+        val fresh = EncryptedDataStoreFactory.createPreferences(context = storageCtx, config = config)
+        assertNull(fresh.get(PreferenceKeys.string("k")))
+        fresh.close()
+    }
 }

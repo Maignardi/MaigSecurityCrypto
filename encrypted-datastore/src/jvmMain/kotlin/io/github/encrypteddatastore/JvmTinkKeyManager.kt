@@ -47,6 +47,7 @@ internal class JvmTinkKeyManager(
         private const val PBKDF2_ITERATIONS = 310_000
         private const val SALT_BYTES = 32
         private const val KEK_BYTES = 32
+        private const val META_CHECKPOINT_INTERVAL = 10L
         private val METADATA_AAD_TAG = "EDST_META_V1".encodeToByteArray()
         private val KEYSET_AAD_TAG = "EDST_KEYSET_V1".encodeToByteArray()
     }
@@ -89,10 +90,12 @@ internal class JvmTinkKeyManager(
 
     override suspend fun encryptEnvelope(
         plaintext: ByteArray,
+        rotationPolicy: KeyRotationPolicy,
         headerBuilder: (CipherAlgorithm, Long) -> ByteArray,
         aadBuilder: (ByteArray) -> ByteArray,
     ): EncryptedEnvelopeResult = mutex.withLock {
         ensureInitializedLocked()
+        rotateIfPolicyRequiresLocked(rotationPolicy)
         val aead = cachedAead!!
         val meta = cachedMetadata!!
         val header = headerBuilder(config.algorithm, meta.epoch)
@@ -103,7 +106,7 @@ internal class JvmTinkKeyManager(
             throw EncryptionException("AEAD encryption failed for '${config.storeName}'", e)
         }
         val updatedMeta = meta.copy(writesSinceRotation = meta.writesSinceRotation + 1L)
-        if (config.keyRotationPolicy is KeyRotationPolicy.Automatic) {
+        if (shouldPersistMetadataWrite(rotationPolicy, updatedMeta.writesSinceRotation)) {
             persistMetadataLocked(aead, updatedMeta)
         }
         cachedMetadata = updatedMeta
@@ -129,25 +132,6 @@ internal class JvmTinkKeyManager(
                 e,
             )
         }
-    }
-
-    override suspend fun rotateIfPolicyRequires(policy: KeyRotationPolicy): Long = mutex.withLock {
-        ensureInitializedLocked()
-        val meta = cachedMetadata!!
-        if (policy is KeyRotationPolicy.Automatic) {
-            val nowMs = System.currentTimeMillis()
-            val ageMs = (nowMs - meta.createdAtEpochMs).coerceAtLeast(0L)
-            val maxAgeMs = policy.maxKeyAge.toLong(DurationUnit.MILLISECONDS)
-            val trigger = when {
-                meta.writesSinceRotation >= policy.maxWritesBeforeRotation -> "write_limit"
-                ageMs >= maxAgeMs -> "max_age"
-                else -> null
-            }
-            if (trigger != null) {
-                return@withLock rotateKeyLocked(policy.maxRetainedKeys.coerceAtLeast(2), trigger)
-            }
-        }
-        meta.epoch
     }
 
     override suspend fun rotateKey(maxRetainedKeys: Int, trigger: String): Long = mutex.withLock {
@@ -204,6 +188,28 @@ internal class JvmTinkKeyManager(
         )
     }
 
+    private fun shouldPersistMetadataWrite(policy: KeyRotationPolicy, writes: Long): Boolean {
+        if (policy !is KeyRotationPolicy.Automatic) return false
+        return policy.maxWritesBeforeRotation < META_CHECKPOINT_INTERVAL * 2 ||
+            writes % META_CHECKPOINT_INTERVAL == 0L
+    }
+
+    private fun rotateIfPolicyRequiresLocked(policy: KeyRotationPolicy) {
+        if (policy !is KeyRotationPolicy.Automatic) return
+        val meta = cachedMetadata!!
+        val nowMs = System.currentTimeMillis()
+        val ageMs = (nowMs - meta.createdAtEpochMs).coerceAtLeast(0L)
+        val maxAgeMs = policy.maxKeyAge.toLong(DurationUnit.MILLISECONDS)
+        val trigger = when {
+            meta.writesSinceRotation >= policy.maxWritesBeforeRotation -> "write_limit"
+            ageMs >= maxAgeMs -> "max_age"
+            else -> null
+        }
+        if (trigger != null) {
+            rotateKeyLocked(policy.maxRetainedKeys.coerceAtLeast(2), trigger)
+        }
+    }
+
     private fun ensureInitializedLocked() {
         check(tinkRegistered)
         if (cachedHandle != null && cachedAead != null && cachedMetadata != null) return
@@ -219,6 +225,7 @@ internal class JvmTinkKeyManager(
     }
 
     private fun initializeFreshLocked(initialEpoch: Long) {
+        val kekAead = deriveOrLoadKekAeadLocked(createIfMissing = true)
         val handle = KeysetHandle.generateNew(keyTemplateFor(config.algorithm))
         val aead = handle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
         val meta = KeyRotationMetadata(
@@ -226,8 +233,9 @@ internal class JvmTinkKeyManager(
             createdAtEpochMs = System.currentTimeMillis(),
             writesSinceRotation = 0L,
         )
-        persistKeysetLocked(handle)
+        persistKeysetWithKekLocked(kekAead, handle)
         persistMetadataLocked(aead, meta)
+        cachedKekAead = kekAead
         cachedHandle = handle
         cachedAead = aead
         cachedMetadata = meta
@@ -241,7 +249,7 @@ internal class JvmTinkKeyManager(
     }
 
     private fun loadExistingLocked() {
-        val kekAead = obtainKekAeadLocked(createIfMissing = false)
+        val kekAead = deriveOrLoadKekAeadLocked(createIfMissing = false)
         val encryptedBytes = readBytes(keysetPath)
         val handle = try {
             TinkProtoKeysetFormat.parseEncryptedKeyset(
@@ -250,6 +258,7 @@ internal class JvmTinkKeyManager(
                 keysetAssociatedData(),
             )
         } catch (e: GeneralSecurityException) {
+            // Do NOT cache unvalidated KEK when unwrap fails (e.g., wrong passphrase).
             throw KeyManagementException("Failed to decrypt keyset for '${config.storeName}'", e)
         }
         val aead = handle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
@@ -262,6 +271,7 @@ internal class JvmTinkKeyManager(
                 writesSinceRotation = 0L,
             ).also { persistMetadataLocked(aead, it) }
         }
+        cachedKekAead = kekAead
         cachedHandle = handle
         cachedAead = aead
         cachedMetadata = meta
@@ -316,7 +326,11 @@ internal class JvmTinkKeyManager(
     }
 
     private fun persistKeysetLocked(handle: KeysetHandle) {
-        val kekAead = obtainKekAeadLocked(createIfMissing = true)
+        val kekAead = deriveOrLoadKekAeadLocked(createIfMissing = true)
+        persistKeysetWithKekLocked(kekAead, handle)
+    }
+
+    private fun persistKeysetWithKekLocked(kekAead: Aead, handle: KeysetHandle) {
         val serialized = TinkProtoKeysetFormat.serializeEncryptedKeyset(
             handle,
             kekAead,
@@ -356,11 +370,11 @@ internal class JvmTinkKeyManager(
         }
     }
 
-    private fun obtainKekAeadLocked(createIfMissing: Boolean): Aead {
+    private fun deriveOrLoadKekAeadLocked(createIfMissing: Boolean): Aead {
         cachedKekAead?.let { return it }
 
         val passphraseProvider = context.masterPassphraseProvider
-        val kekAead = if (passphraseProvider != null) {
+        return if (passphraseProvider != null) {
             val salt = if (context.fileSystem.exists(kekSaltOrSecretPath)) {
                 readBytes(kekSaltOrSecretPath)
             } else {
@@ -372,7 +386,6 @@ internal class JvmTinkKeyManager(
                     atomicWrite(kekSaltOrSecretPath, it)
                 }
             }
-            // Copy caller-supplied CharArray so we never mutate a reusable buffer held by the caller.
             val passphraseCopy = passphraseProvider.invoke().copyOf()
             val derivedKey = try {
                 derivePbkdf2Key(passphraseCopy, salt)
@@ -402,9 +415,6 @@ internal class JvmTinkKeyManager(
                 secret.wipe()
             }
         }
-
-        cachedKekAead = kekAead
-        return kekAead
     }
 
     private fun derivePbkdf2Key(passphrase: CharArray, salt: ByteArray): ByteArray {
@@ -433,7 +443,6 @@ internal class JvmTinkKeyManager(
         if (tmpFile.exists()) {
             tmpFile.delete()
         }
-        // Create temp file with restrictive 0600 permissions BEFORE writing any sensitive bytes.
         try {
             val perms = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
             Files.createFile(tmpNio, perms)
@@ -471,18 +480,21 @@ internal class JvmTinkKeyManager(
     }
 
     private fun keysetAssociatedData(): ByteArray =
-        buildDomainAad(KEYSET_AAD_TAG, config.storeName)
+        buildDomainAad(KEYSET_AAD_TAG, "${context.applicationContextOrName}:${config.storeName}")
 
     private fun metadataAssociatedData(): ByteArray =
-        buildDomainAad(METADATA_AAD_TAG, config.storeName)
+        buildDomainAad(METADATA_AAD_TAG, "${context.applicationContextOrName}:${config.storeName}")
 
-    private fun buildDomainAad(domain: ByteArray, storeName: String): ByteArray {
-        val storeBytes = storeName.encodeToByteArray()
+    private val PlatformStorageContext.applicationContextOrName: String
+        get() = config.storeName
+
+    private fun buildDomainAad(domain: ByteArray, scope: String): ByteArray {
+        val scopeBytes = scope.encodeToByteArray()
         return Buffer().apply {
             writeInt(domain.size)
             write(domain)
-            writeInt(storeBytes.size)
-            write(storeBytes)
+            writeInt(scopeBytes.size)
+            write(scopeBytes)
         }.readByteArray()
     }
 
@@ -492,5 +504,6 @@ internal class JvmTinkKeyManager(
     private fun tinkParameterName(algorithm: CipherAlgorithm): String = when (algorithm) {
         CipherAlgorithm.AES256_GCM -> "AES256_GCM"
         CipherAlgorithm.XCHACHA20_POLY1305 -> "XCHACHA20_POLY1305"
+        CipherAlgorithm.AES256_CTR_HMAC_SHA256 -> "AES256_CTR_HMAC_SHA256"
     }
 }

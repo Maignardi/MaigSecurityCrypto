@@ -15,6 +15,64 @@ public data class SharedPreferencesMigrationReport(
 )
 
 /**
+ * DataStore-integrated [EncryptedPreferencesMigration] that runs atomically before any reads or
+ * writes are served when passed to [EncryptedDataStoreFactory.createPreferences].
+ */
+public class SharedPreferencesDataMigration(
+    private val source: SharedPreferences,
+    private val keysToMigrate: Set<String>? = null,
+    private val clearSourceOnSuccess: Boolean = true,
+    private val overwriteExisting: Boolean = false,
+) : EncryptedPreferencesMigration {
+
+    override suspend fun shouldMigrate(snapshot: EncryptedPreferencesSnapshot): Boolean {
+        val entries = withContext(Dispatchers.IO) { source.all }
+        if (entries.isEmpty()) return false
+        return entries.keys.any { key ->
+            (keysToMigrate == null || key in keysToMigrate) &&
+                (overwriteExisting || !snapshot.containsName(key))
+        }
+    }
+
+    override suspend fun migrate(mutable: MutableEncryptedPreferences) {
+        val allEntries = withContext(Dispatchers.IO) { source.all }
+        for ((key, value) in allEntries) {
+            if (keysToMigrate != null && key !in keysToMigrate) continue
+            if (!overwriteExisting && mutable.containsName(key)) continue
+            when (value) {
+                is String -> mutable[PreferenceKeys.string(key)] = value
+                is Int -> mutable[PreferenceKeys.int(key)] = value
+                is Long -> mutable[PreferenceKeys.long(key)] = value
+                is Float -> mutable[PreferenceKeys.float(key)] = value
+                is Boolean -> mutable[PreferenceKeys.boolean(key)] = value
+                is Set<*> -> {
+                    @Suppress("UNCHECKED_CAST")
+                    if (value.all { it is String }) {
+                        mutable[PreferenceKeys.stringSet(key)] = (value as Set<String>).toSet()
+                    }
+                }
+            }
+        }
+    }
+
+    override suspend fun cleanUp() {
+        if (!clearSourceOnSuccess) return
+        withContext(Dispatchers.IO) {
+            if (keysToMigrate == null) {
+                source.edit().clear().commit()
+            } else {
+                source.edit().apply {
+                    keysToMigrate.forEach { remove(it) }
+                }.commit()
+            }
+        }
+    }
+
+    private fun EncryptedPreferencesSnapshot.containsName(name: String): Boolean =
+        name in keys()
+}
+
+/**
  * Migrates entries from a legacy [SharedPreferences] (including deprecated
  * `androidx.security.crypto.EncryptedSharedPreferences`) into this [EncryptedPreferences].
  *

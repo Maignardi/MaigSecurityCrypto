@@ -2,12 +2,15 @@
     kotlinx.cinterop.ExperimentalForeignApi::class,
     kotlinx.cinterop.BetaInteropApi::class,
     kotlin.io.encoding.ExperimentalEncodingApi::class,
+    dev.whyoleg.cryptography.DelicateCryptographyApi::class,
 )
 
 package io.github.encrypteddatastore
 
 import dev.whyoleg.cryptography.CryptographyProvider
 import dev.whyoleg.cryptography.algorithms.AES
+import dev.whyoleg.cryptography.algorithms.HMAC
+import dev.whyoleg.cryptography.algorithms.SHA256
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
@@ -19,6 +22,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okio.Buffer
 import platform.CoreFoundation.CFDictionaryAddValue
 import platform.CoreFoundation.CFDictionaryCreateMutable
 import platform.CoreFoundation.CFDictionaryRef
@@ -35,6 +39,7 @@ import platform.Foundation.NSData
 import platform.Foundation.NSDate
 import platform.Foundation.create
 import platform.Foundation.timeIntervalSince1970
+import platform.LocalAuthentication.LAContext
 import platform.Security.SecAccessControlCreateWithFlags
 import platform.Security.SecItemAdd
 import platform.Security.SecItemCopyMatching
@@ -46,6 +51,7 @@ import platform.Security.errSecDuplicateItem
 import platform.Security.errSecInteractionNotAllowed
 import platform.Security.errSecItemNotFound
 import platform.Security.errSecSuccess
+import platform.Security.errSecUserCanceled
 import platform.Security.kSecAccessControlBiometryAny
 import platform.Security.kSecAccessControlBiometryCurrentSet
 import platform.Security.kSecAccessControlUserPresence
@@ -62,6 +68,7 @@ import platform.Security.kSecMatchLimit
 import platform.Security.kSecMatchLimitOne
 import platform.Security.kSecRandomDefault
 import platform.Security.kSecReturnData
+import platform.Security.kSecUseAuthenticationContext
 import platform.Security.kSecValueData
 import platform.posix.memcpy
 import kotlin.io.encoding.Base64
@@ -76,11 +83,14 @@ internal data class IosKeychainKeysetRecord(
 )
 
 /**
- * iOS Keychain-backed [KeyManager] using Apple native cryptography via `cryptography-provider-apple`
- * and `ThisDeviceOnly` Keychain items (`SecItem*`).
+ * iOS Keychain-backed [KeyManager] using Apple native `CommonCrypto` via `cryptography-provider-apple`
+ * (`AES-256-CTR + HMAC-SHA256` Encrypt-then-MAC with domain-separated subkeys) and `ThisDeviceOnly`
+ * Keychain items (`SecItem*`).
  *
- * Note: Only [CipherAlgorithm.AES256_GCM] is supported on iOS. When [SecurityConfig.userAuthConfig]
- * is set, the Keychain record is protected by `SecAccessControl` and not cached in memory across calls.
+ * - Only [CipherAlgorithm.AES256_CTR_HMAC_SHA256] is supported on iOS.
+ * - When [SecurityConfig.userAuthConfig] is set, Keychain items use `SecAccessControl` and a shared
+ *   `LAContext` configured with `touchIDAuthenticationAllowableReuseDuration` matching
+ *   `authValidityDurationSeconds`, and the DEK record is not cached in RAM across operations.
  */
 internal class IosKeychainKeyManager(
     private val context: PlatformStorageContext,
@@ -89,12 +99,18 @@ internal class IosKeychainKeyManager(
 
     private companion object {
         const val KEY_BYTES = 32
+        const val IV_BYTES = 16
+        const val MAC_TAG_BYTES = 32
+        const val META_CHECKPOINT_INTERVAL = 10L
+        val ENC_SUBKEY_LABEL = "EDST_IOS_CTR_ENC_V1".encodeToByteArray()
+        val MAC_SUBKEY_LABEL = "EDST_IOS_HMAC_SHA256_V1".encodeToByteArray()
     }
 
     init {
-        if (config.algorithm != CipherAlgorithm.AES256_GCM) {
+        if (config.algorithm != CipherAlgorithm.AES256_CTR_HMAC_SHA256) {
             throw KeyManagementException(
-                "CipherAlgorithm.${config.algorithm} is not supported on iOS; use CipherAlgorithm.AES256_GCM."
+                "CipherAlgorithm.${config.algorithm} is not supported on iOS; " +
+                    "use CipherAlgorithm.AES256_CTR_HMAC_SHA256 (the iOS default)."
             )
         }
     }
@@ -102,12 +118,21 @@ internal class IosKeychainKeyManager(
     private val mutex = Mutex()
     private val json = Json { ignoreUnknownKeys = true }
     private val provider = CryptographyProvider.Default
-    private val aesGcm = provider.get(AES.GCM)
+    private val aesCtr = provider.get(AES.CTR)
+    private val hmac = provider.get(HMAC)
     private val serviceName = context.resolvedServiceName()
     private val accountName = "edst_dek_${config.storeName}"
     private val shouldCacheInMemory: Boolean = config.userAuthConfig == null
 
+    private val reusableLaContext: LAContext? = config.userAuthConfig?.let { auth ->
+        LAContext().apply {
+            touchIDAuthenticationAllowableReuseDuration = auth.authValidityDurationSeconds.toDouble()
+        }
+    }
+
     private var cachedRecord: IosKeychainKeysetRecord? = null
+    private var inMemoryWritesSinceRotation: Long? = null
+    private var lastKnownEpoch: Long = 0L
 
     override suspend fun currentEpoch(): Long = mutex.withLock {
         ensureInitializedLocked().currentEpoch
@@ -118,40 +143,66 @@ internal class IosKeychainKeyManager(
     }
 
     override suspend fun writesSinceRotation(): Long = mutex.withLock {
-        ensureInitializedLocked().writesSinceRotation
+        val record = ensureInitializedLocked()
+        inMemoryWritesSinceRotation ?: record.writesSinceRotation
     }
 
     override suspend fun encryptEnvelope(
         plaintext: ByteArray,
+        rotationPolicy: KeyRotationPolicy,
         headerBuilder: (CipherAlgorithm, Long) -> ByteArray,
         aadBuilder: (ByteArray) -> ByteArray,
     ): EncryptedEnvelopeResult = mutex.withLock {
-        val record = ensureInitializedLocked()
+        var record = ensureInitializedLocked()
+        record = rotateIfPolicyRequiresLocked(record, rotationPolicy)
         val keyBase64 = record.epochKeysBase64[record.currentEpoch]
             ?: throw KeyManagementException("Missing DEK for epoch ${record.currentEpoch}")
-        val rawKey = Base64.decode(keyBase64)
+        val masterKey = Base64.decode(keyBase64)
+        var encKeyBytes: ByteArray? = null
+        var macKeyBytes: ByteArray? = null
         try {
-            val header = headerBuilder(CipherAlgorithm.AES256_GCM, record.currentEpoch)
+            val header = headerBuilder(CipherAlgorithm.AES256_CTR_HMAC_SHA256, record.currentEpoch)
             val aad = aadBuilder(header)
-            val key = aesGcm.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, rawKey)
-            val ciphertext = key.cipher().encrypt(plaintext, aad)
-            val updated = record.copy(writesSinceRotation = record.writesSinceRotation + 1L)
-            if (config.keyRotationPolicy is KeyRotationPolicy.Automatic) {
+
+            val (derivedEnc, derivedMac) = deriveSubkeys(masterKey)
+            encKeyBytes = derivedEnc
+            macKeyBytes = derivedMac
+
+            val iv = generateRandomBytes(IV_BYTES)
+            val aesKey = aesCtr.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, derivedEnc)
+            val ct = aesKey.cipher().encryptWithIv(iv, plaintext)
+
+            val macInput = buildMacInput(aad, iv, ct)
+            val macKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, derivedMac)
+            val tag = macKey.signatureGenerator().generateSignature(macInput)
+
+            val payload = ByteArray(IV_BYTES + ct.size + tag.size)
+            iv.copyInto(payload, destinationOffset = 0)
+            ct.copyInto(payload, destinationOffset = IV_BYTES)
+            tag.copyInto(payload, destinationOffset = IV_BYTES + ct.size)
+
+            val nextWrites = (inMemoryWritesSinceRotation ?: record.writesSinceRotation) + 1L
+            val updated = record.copy(writesSinceRotation = nextWrites)
+            if (shouldPersistMetadataWrite(rotationPolicy, nextWrites)) {
                 saveRecordToKeychain(updated)
             }
+            inMemoryWritesSinceRotation = nextWrites
+            lastKnownEpoch = record.currentEpoch
             if (shouldCacheInMemory) {
                 cachedRecord = updated
             }
             EncryptedEnvelopeResult(
                 keyEpoch = record.currentEpoch,
-                envelopeBytes = EncryptedEnvelopeCodec.encode(header, ciphertext),
+                envelopeBytes = EncryptedEnvelopeCodec.encode(header, payload),
             )
         } catch (e: SecurityStorageException) {
             throw e
         } catch (e: Throwable) {
             throw EncryptionException("iOS AEAD encryption failed for '${config.storeName}'", e)
         } finally {
-            rawKey.wipe()
+            masterKey.wipe()
+            encKeyBytes?.wipe()
+            macKeyBytes?.wipe()
         }
     }
 
@@ -161,9 +212,14 @@ internal class IosKeychainKeyManager(
         keyEpoch: Long,
         associatedData: ByteArray,
     ): ByteArray = mutex.withLock {
-        if (algorithm != CipherAlgorithm.AES256_GCM) {
+        if (algorithm != CipherAlgorithm.AES256_CTR_HMAC_SHA256) {
             throw StoreTamperedOrCorruptedException(
                 "Unsupported cipher algorithm $algorithm on iOS for '${config.storeName}'"
+            )
+        }
+        if (ciphertext.size < IV_BYTES + MAC_TAG_BYTES) {
+            throw StoreTamperedOrCorruptedException(
+                "iOS encrypted payload is truncated (${ciphertext.size} bytes)"
             )
         }
         val record = ensureInitializedLocked()
@@ -171,41 +227,48 @@ internal class IosKeychainKeyManager(
             ?: throw StoreTamperedOrCorruptedException(
                 "No retained DEK for epoch $keyEpoch in '${config.storeName}'"
             )
-        val rawKey = Base64.decode(keyBase64)
+        val masterKey = Base64.decode(keyBase64)
+        var encKeyBytes: ByteArray? = null
+        var macKeyBytes: ByteArray? = null
         try {
-            val key = aesGcm.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, rawKey)
-            key.cipher().decrypt(ciphertext, associatedData)
+            val (derivedEnc, derivedMac) = deriveSubkeys(masterKey)
+            encKeyBytes = derivedEnc
+            macKeyBytes = derivedMac
+
+            val iv = ciphertext.copyOfRange(0, IV_BYTES)
+            val ctEnd = ciphertext.size - MAC_TAG_BYTES
+            val ct = ciphertext.copyOfRange(IV_BYTES, ctEnd)
+            val tag = ciphertext.copyOfRange(ctEnd, ciphertext.size)
+
+            // Encrypt-then-MAC: always verify HMAC-SHA256 before decrypting
+            val macInput = buildMacInput(associatedData, iv, ct)
+            val macKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, derivedMac)
+            val validTag = macKey.signatureVerifier().tryVerifySignature(macInput, tag)
+            if (!validTag) {
+                throw StoreTamperedOrCorruptedException(
+                    "iOS HMAC authentication failed for '${config.storeName}' (epoch=$keyEpoch)"
+                )
+            }
+
+            val aesKey = aesCtr.keyDecoder().decodeFromByteArray(AES.Key.Format.RAW, derivedEnc)
+            aesKey.cipher().decryptWithIv(iv, ct)
+        } catch (e: SecurityStorageException) {
+            throw e
         } catch (e: Throwable) {
             throw StoreTamperedOrCorruptedException(
-                "iOS AEAD authentication failed for '${config.storeName}' (epoch=$keyEpoch)",
+                "iOS decryption failed for '${config.storeName}' (epoch=$keyEpoch)",
                 e,
             )
         } finally {
-            rawKey.wipe()
+            masterKey.wipe()
+            encKeyBytes?.wipe()
+            macKeyBytes?.wipe()
         }
-    }
-
-    override suspend fun rotateIfPolicyRequires(policy: KeyRotationPolicy): Long = mutex.withLock {
-        val record = ensureInitializedLocked()
-        if (policy is KeyRotationPolicy.Automatic) {
-            val nowMs = currentTimeMillis()
-            val ageMs = (nowMs - record.keyCreatedAtEpochMs).coerceAtLeast(0L)
-            val maxAgeMs = policy.maxKeyAge.toLong(DurationUnit.MILLISECONDS)
-            val trigger = when {
-                record.writesSinceRotation >= policy.maxWritesBeforeRotation -> "write_limit"
-                ageMs >= maxAgeMs -> "max_age"
-                else -> null
-            }
-            if (trigger != null) {
-                return@withLock rotateKeyLocked(record, policy.maxRetainedKeys.coerceAtLeast(2), trigger)
-            }
-        }
-        record.currentEpoch
     }
 
     override suspend fun rotateKey(maxRetainedKeys: Int, trigger: String): Long = mutex.withLock {
         val record = ensureInitializedLocked()
-        rotateKeyLocked(record, maxRetainedKeys.coerceAtLeast(2), trigger)
+        rotateKeyLocked(record, maxRetainedKeys.coerceAtLeast(2), trigger).currentEpoch
     }
 
     override suspend fun pruneHistoricalKeys() {
@@ -222,12 +285,14 @@ internal class IosKeychainKeyManager(
     }
 
     override suspend fun resetAndRegenerate(reason: String): Long = mutex.withLock {
-        val prevEpoch = cachedRecord?.currentEpoch ?: 0L
+        val prevEpoch = cachedRecord?.currentEpoch ?: lastKnownEpoch
         deleteFromKeychain()
         cachedRecord = null
+        inMemoryWritesSinceRotation = 0L
         val freshEpoch = (prevEpoch + 1L).coerceAtLeast(1L)
         val freshRecord = createFreshRecord(freshEpoch)
         saveRecordToKeychain(freshRecord)
+        lastKnownEpoch = freshEpoch
         if (shouldCacheInMemory) {
             cachedRecord = freshRecord
         }
@@ -236,16 +301,60 @@ internal class IosKeychainKeyManager(
 
     override suspend fun diagnostics(): SecurityDiagnostics = mutex.withLock {
         val record = ensureInitializedLocked()
+        val writes = inMemoryWritesSinceRotation ?: record.writesSinceRotation
         SecurityDiagnostics(
             storeName = config.storeName,
-            algorithm = CipherAlgorithm.AES256_GCM,
+            algorithm = CipherAlgorithm.AES256_CTR_HMAC_SHA256,
             securityLevel = SecurityLevel.KEYCHAIN,
             currentKeyEpoch = record.currentEpoch,
             keyCreatedAtEpochMs = record.keyCreatedAtEpochMs,
-            writesSinceRotation = record.writesSinceRotation,
-            // DEK is protected at rest in Keychain, then loaded into app memory for AES-GCM.
+            writesSinceRotation = writes,
             hardwareBacked = false,
         )
+    }
+
+    private suspend fun deriveSubkeys(masterKey: ByteArray): Pair<ByteArray, ByteArray> {
+        val prfKey = hmac.keyDecoder(SHA256).decodeFromByteArray(HMAC.Key.Format.RAW, masterKey)
+        val generator = prfKey.signatureGenerator()
+        val encKey = generator.generateSignature(ENC_SUBKEY_LABEL)
+        val macKey = generator.generateSignature(MAC_SUBKEY_LABEL)
+        return encKey to macKey
+    }
+
+    private fun buildMacInput(aad: ByteArray, iv: ByteArray, ct: ByteArray): ByteArray {
+        return Buffer().apply {
+            writeInt(aad.size)
+            write(aad)
+            write(iv)
+            write(ct)
+        }.readByteArray()
+    }
+
+    private fun shouldPersistMetadataWrite(policy: KeyRotationPolicy, writes: Long): Boolean {
+        if (policy !is KeyRotationPolicy.Automatic) return false
+        return policy.maxWritesBeforeRotation < META_CHECKPOINT_INTERVAL * 2 ||
+            writes % META_CHECKPOINT_INTERVAL == 0L
+    }
+
+    private fun rotateIfPolicyRequiresLocked(
+        record: IosKeychainKeysetRecord,
+        policy: KeyRotationPolicy,
+    ): IosKeychainKeysetRecord {
+        if (policy !is KeyRotationPolicy.Automatic) return record
+        val nowMs = currentTimeMillis()
+        val ageMs = (nowMs - record.keyCreatedAtEpochMs).coerceAtLeast(0L)
+        val maxAgeMs = policy.maxKeyAge.toLong(DurationUnit.MILLISECONDS)
+        val writes = inMemoryWritesSinceRotation ?: record.writesSinceRotation
+        val trigger = when {
+            writes >= policy.maxWritesBeforeRotation -> "write_limit"
+            ageMs >= maxAgeMs -> "max_age"
+            else -> null
+        }
+        return if (trigger != null) {
+            rotateKeyLocked(record, policy.maxRetainedKeys.coerceAtLeast(2), trigger)
+        } else {
+            record
+        }
     }
 
     private fun ensureInitializedLocked(): IosKeychainKeysetRecord {
@@ -259,10 +368,14 @@ internal class IosKeychainKeyManager(
                     IosKeychainKeysetRecord.serializer(),
                     existingBytes.decodeToString(),
                 )
+                val syncedWrites = inMemoryWritesSinceRotation ?: parsed.writesSinceRotation
+                val synced = parsed.copy(writesSinceRotation = syncedWrites)
+                inMemoryWritesSinceRotation = syncedWrites
+                lastKnownEpoch = synced.currentEpoch
                 if (shouldCacheInMemory) {
-                    cachedRecord = parsed
+                    cachedRecord = synced
                 }
-                parsed
+                synced
             } catch (e: Throwable) {
                 throw StoreTamperedOrCorruptedException(
                     "Corrupted Keychain record for '${config.storeName}'",
@@ -275,6 +388,8 @@ internal class IosKeychainKeyManager(
 
         val fresh = createFreshRecord(1L)
         saveRecordToKeychain(fresh)
+        inMemoryWritesSinceRotation = 0L
+        lastKnownEpoch = fresh.currentEpoch
         if (shouldCacheInMemory) {
             cachedRecord = fresh
         }
@@ -292,7 +407,7 @@ internal class IosKeychainKeyManager(
         current: IosKeychainKeysetRecord,
         maxRetainedKeys: Int,
         trigger: String,
-    ): Long {
+    ): IosKeychainKeysetRecord {
         val newEpoch = current.currentEpoch + 1L
         val newKey = generateRandomBytes(KEY_BYTES)
         val newMap = current.epochKeysBase64.toMutableMap()
@@ -311,6 +426,8 @@ internal class IosKeychainKeyManager(
             epochKeysBase64 = retainedMap,
         )
         saveRecordToKeychain(updated)
+        inMemoryWritesSinceRotation = 0L
+        lastKnownEpoch = newEpoch
         if (shouldCacheInMemory) {
             cachedRecord = updated
         }
@@ -322,7 +439,7 @@ internal class IosKeychainKeyManager(
                 trigger = trigger,
             )
         )
-        return newEpoch
+        return updated
     }
 
     private fun createFreshRecord(epoch: Long): IosKeychainKeysetRecord {
@@ -361,6 +478,14 @@ internal class IosKeychainKeyManager(
             kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
     }
 
+    private fun accessControlProtectionConst(): CFTypeRef? = when (config.iosAccessibility) {
+        IosKeychainAccessibility.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY ->
+            kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+        IosKeychainAccessibility.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+        IosKeychainAccessibility.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY ->
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+    }
+
     private fun createAccessControlOrNull(): CFTypeRef? {
         val auth = config.userAuthConfig ?: return null
         val flags = when {
@@ -372,7 +497,7 @@ internal class IosKeychainKeyManager(
             val error = alloc<CFErrorRefVar>()
             val acl = SecAccessControlCreateWithFlags(
                 allocator = null,
-                protection = kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                protection = accessControlProtectionConst(),
                 flags = flags,
                 error = error.ptr,
             )
@@ -384,7 +509,7 @@ internal class IosKeychainKeyManager(
     }
 
     private fun readFromKeychain(): ByteArray? = memScoped {
-        val query = createBaseQuery()
+        val query = createBaseQuery(includeAuthContext = true)
         CFDictionaryAddValue(query, kSecReturnData, kCFBooleanTrue)
         CFDictionaryAddValue(query, kSecMatchLimit, kSecMatchLimitOne)
         val resultRef = alloc<CFTypeRefVar>()
@@ -396,9 +521,9 @@ internal class IosKeychainKeyManager(
                 data.toByteArray()
             }
             errSecItemNotFound -> null
-            errSecAuthFailed, errSecInteractionNotAllowed ->
+            errSecAuthFailed, errSecInteractionNotAllowed, errSecUserCanceled ->
                 throw UserAuthenticationRequiredException(
-                    "iOS Keychain authentication required (OSStatus=$status)"
+                    "iOS Keychain authentication required or cancelled (OSStatus=$status)"
                 )
             else -> throw KeystoreUnavailableException("Keychain read failed with OSStatus=$status")
         }
@@ -411,7 +536,7 @@ internal class IosKeychainKeyManager(
 
         val dataRef = CFBridgingRetain(nsData)
         val accessControl = createAccessControlOrNull()
-        val addQuery = createBaseQuery()
+        val addQuery = createBaseQuery(includeAuthContext = true)
         CFDictionaryAddValue(addQuery, kSecValueData, dataRef)
         if (accessControl != null) {
             CFDictionaryAddValue(addQuery, kSecAttrAccessControl, accessControl)
@@ -423,7 +548,7 @@ internal class IosKeychainKeyManager(
         CFRelease(addQuery)
 
         if (status == errSecDuplicateItem) {
-            val matchQuery = createBaseQuery()
+            val matchQuery = createBaseQuery(includeAuthContext = true)
             val updateAttrs = CFDictionaryCreateMutable(
                 null,
                 2,
@@ -445,16 +570,16 @@ internal class IosKeychainKeyManager(
 
         when (status) {
             errSecSuccess -> Unit
-            errSecAuthFailed, errSecInteractionNotAllowed ->
+            errSecAuthFailed, errSecInteractionNotAllowed, errSecUserCanceled ->
                 throw UserAuthenticationRequiredException(
-                    "iOS Keychain authentication required on write (OSStatus=$status)"
+                    "iOS Keychain authentication required or cancelled on write (OSStatus=$status)"
                 )
             else -> throw KeystoreUnavailableException("Keychain write failed with OSStatus=$status")
         }
     }
 
     private fun deleteFromKeychain() {
-        val query = createBaseQuery()
+        val query = createBaseQuery(includeAuthContext = false)
         val status = SecItemDelete(query)
         CFRelease(query)
         if (status != errSecSuccess && status != errSecItemNotFound) {
@@ -462,10 +587,10 @@ internal class IosKeychainKeyManager(
         }
     }
 
-    private fun createBaseQuery(): CFDictionaryRef? {
+    private fun createBaseQuery(includeAuthContext: Boolean): CFDictionaryRef? {
         val dict = CFDictionaryCreateMutable(
             null,
-            5,
+            6,
             kCFTypeDictionaryKeyCallBacks.ptr,
             kCFTypeDictionaryValueCallBacks.ptr,
         )
@@ -474,6 +599,11 @@ internal class IosKeychainKeyManager(
         CFDictionaryAddValue(dict, kSecClass, kSecClassGenericPassword)
         CFDictionaryAddValue(dict, kSecAttrService, serviceRef)
         CFDictionaryAddValue(dict, kSecAttrAccount, accountRef)
+        if (includeAuthContext && reusableLaContext != null) {
+            val ctxRef = CFBridgingRetain(reusableLaContext)
+            CFDictionaryAddValue(dict, kSecUseAuthenticationContext, ctxRef)
+            if (ctxRef != null) CFRelease(ctxRef)
+        }
         if (serviceRef != null) CFRelease(serviceRef)
         if (accountRef != null) CFRelease(accountRef)
         return dict

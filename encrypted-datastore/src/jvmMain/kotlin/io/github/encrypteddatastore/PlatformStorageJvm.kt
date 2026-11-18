@@ -61,6 +61,8 @@ internal fun enforceRestrictiveDirPermissions(path: Path) {
 internal actual fun defaultIoCoroutineScope(): CoroutineScope =
     CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+internal actual fun defaultCipherAlgorithm(): CipherAlgorithm = CipherAlgorithm.AES256_GCM
+
 internal actual fun createPlatformKeyManager(
     context: PlatformStorageContext,
     config: SecurityConfig,

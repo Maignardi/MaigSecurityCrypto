@@ -30,6 +30,8 @@ public class EncryptedDataStore<T> internal constructor(
 
     /**
      * Reactive stream of decrypted values.
+     *
+     * Note: Once decrypted into memory, DataStore caches the latest value for active collectors.
      */
     public val data: Flow<T> = internalStore.data
         .map { it.value }
@@ -37,14 +39,13 @@ public class EncryptedDataStore<T> internal constructor(
 
     /**
      * Atomically reads, transforms, and writes the encrypted state.
-     * Automatically triggers key rotation before writing if configured by [SecurityConfig.keyRotationPolicy].
+     * Automatic key rotation (when configured) runs inside the write transaction.
      */
     public suspend fun updateData(transform: suspend (t: T) -> T): T {
         return operationMutex.withLock {
-            val activeEpoch = keyManager.rotateIfPolicyRequires(config.keyRotationPolicy)
             val updated = internalStore.updateData { box ->
                 val newValue = transform(box.value)
-                EncryptedBox(value = newValue, keyEpoch = activeEpoch)
+                EncryptedBox(value = newValue, keyEpoch = box.keyEpoch)
             }
             enforceRestrictiveFilePermissions(fileSystem, filePath)
             updated.value
@@ -80,6 +81,9 @@ public class EncryptedDataStore<T> internal constructor(
     /**
      * Destroys all persisted data, resets the store to its default value, and destroys all
      * historical encryption keys so prior ciphertexts cannot be recovered.
+     *
+     * Requires the existing store/keyset to be readable; if the store is unrecoverably corrupted
+     * or invalidated under [KeystoreRecoveryPolicy.STRICT], use [forceResetAndClose] instead.
      */
     public suspend fun clearAndReset() {
         operationMutex.withLock {
@@ -89,6 +93,22 @@ public class EncryptedDataStore<T> internal constructor(
             }
             keyManager.pruneHistoricalKeys()
             enforceRestrictiveFilePermissions(fileSystem, filePath)
+        }
+    }
+
+    /**
+     * Forcefully wipes the encrypted file and resets all underlying key material without
+     * attempting to decrypt existing data, then closes this store instance.
+     *
+     * Intended as an explicit user-triggered recovery escape hatch when a store using
+     * [KeystoreRecoveryPolicy.STRICT] encounters permanent key invalidation or corruption.
+     * After calling this method, create a new instance via [EncryptedDataStoreFactory].
+     */
+    public suspend fun forceResetAndClose() {
+        operationMutex.withLock {
+            storeScope.coroutineContext.job.cancelAndJoin()
+            fileSystem.delete(filePath, mustExist = false)
+            keyManager.resetAndRegenerate(reason = "explicit_force_reset")
         }
     }
 

@@ -413,6 +413,86 @@ class EncryptedDataStoreSecurityTest {
     }
 
     @Test
+    fun `wrong passphrase does not poison KEK cache or wipe store under CLEAR_AND_REGENERATE`() = runTest {
+        val store = EncryptedDataStoreFactory.create(
+            context = testContext { "vault-pass-1".toCharArray() },
+            config = SecurityConfig(
+                storeName = "pass_no_wipe",
+                recoveryPolicy = KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE,
+            ),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession() },
+        )
+        store.updateData { AuthSession(accessToken = "precious_data") }
+        store.close()
+
+        // Same instance receives wrong passphrase first, then correct passphrase: must NOT poison cache
+        var dynamicPass = "wrong-pass"
+        val dynamicStore = EncryptedDataStoreFactory.create(
+            context = testContext { dynamicPass.toCharArray() },
+            config = SecurityConfig(
+                storeName = "pass_no_wipe",
+                recoveryPolicy = KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE,
+            ),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession() },
+        )
+        assertFailsWith<KeyManagementException> {
+            dynamicStore.get()
+        }
+
+        // Now provide the right passphrase on the SAME instance: data must still be intact!
+        dynamicPass = "vault-pass-1"
+        assertEquals("precious_data", dynamicStore.get().accessToken)
+        dynamicStore.close()
+    }
+
+    @Test
+    fun `forceResetAndClose recovers a corrupted STRICT store cleanly`() = runTest {
+        val store = EncryptedDataStoreFactory.create(
+            context = testContext(),
+            config = SecurityConfig(
+                storeName = "force_reset_strict",
+                recoveryPolicy = KeystoreRecoveryPolicy.STRICT,
+            ),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession(accessToken = "fresh") },
+        )
+        store.updateData { AuthSession(accessToken = "before_corruption") }
+        store.close()
+
+        FileSystem.SYSTEM.write(storeFilePath("force_reset_strict")) {
+            write("corrupted_bytes".encodeToByteArray())
+        }
+
+        val broken = EncryptedDataStoreFactory.create(
+            context = testContext(),
+            config = SecurityConfig(
+                storeName = "force_reset_strict",
+                recoveryPolicy = KeystoreRecoveryPolicy.STRICT,
+            ),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession(accessToken = "fresh") },
+        )
+        assertFailsWith<StoreTamperedOrCorruptedException> {
+            broken.get()
+        }
+        broken.forceResetAndClose()
+
+        val recreated = EncryptedDataStoreFactory.create(
+            context = testContext(),
+            config = SecurityConfig(
+                storeName = "force_reset_strict",
+                recoveryPolicy = KeystoreRecoveryPolicy.STRICT,
+            ),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession(accessToken = "fresh") },
+        )
+        assertEquals("fresh", recreated.get().accessToken)
+        recreated.close()
+    }
+
+    @Test
     fun `EncryptedPreferences handles all types reactive observation and persistence`() = runTest {
         val prefs = EncryptedDataStoreFactory.createPreferences(
             context = testContext(),

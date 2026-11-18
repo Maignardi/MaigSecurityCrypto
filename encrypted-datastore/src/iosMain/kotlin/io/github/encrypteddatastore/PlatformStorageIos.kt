@@ -72,6 +72,8 @@ internal actual fun enforceRestrictiveFilePermissions(
 internal actual fun defaultIoCoroutineScope(): CoroutineScope =
     CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+internal actual fun defaultCipherAlgorithm(): CipherAlgorithm = CipherAlgorithm.AES256_CTR_HMAC_SHA256
+
 internal actual fun createPlatformKeyManager(
     context: PlatformStorageContext,
     config: SecurityConfig,

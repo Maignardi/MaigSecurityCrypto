@@ -213,6 +213,15 @@ public class MutableEncryptedPreferences internal constructor(
 }
 
 /**
+ * Migration hook executed atomically inside DataStore before any reads or writes are served.
+ */
+public interface EncryptedPreferencesMigration {
+    public suspend fun shouldMigrate(snapshot: EncryptedPreferencesSnapshot): Boolean
+    public suspend fun migrate(mutable: MutableEncryptedPreferences)
+    public suspend fun cleanUp() {}
+}
+
+/**
  * Modern, reactive, encrypted replacement for Android's deprecated `EncryptedSharedPreferences`.
  */
 public class EncryptedPreferences internal constructor(
@@ -246,6 +255,14 @@ public class EncryptedPreferences internal constructor(
 
     public suspend fun clearAndReset() {
         store.clearAndReset()
+    }
+
+    /**
+     * Forcefully wipes the encrypted preferences file and key material without decrypting,
+     * then closes this instance. Create a new instance via [EncryptedDataStoreFactory] afterward.
+     */
+    public suspend fun forceResetAndClose() {
+        store.forceResetAndClose()
     }
 
     public suspend fun diagnostics(): SecurityDiagnostics = store.diagnostics()

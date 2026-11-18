@@ -68,7 +68,7 @@ dependencyResolutionManagement {
 **Android app/library (`app/build.gradle.kts`):**
 ```kotlin
 dependencies {
-    implementation("com.github.Maignardi:encrypted-datastore:0.1.1")
+    implementation("com.github.Maignardi:encrypted-datastore:0.1.2")
 }
 ```
 
@@ -78,7 +78,7 @@ dependencies {
 
 ```toml
 [versions]
-encryptedDatastore = "0.1.1"
+encryptedDatastore = "0.1.2"
 
 [libraries]
 encrypted-datastore = { module = "com.github.Maignardi:encrypted-datastore", version.ref = "encryptedDatastore" }
@@ -108,7 +108,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.maignardi:encrypted-datastore:0.1.1")
+    implementation("io.github.maignardi:encrypted-datastore:0.1.2")
 }
 ```
 
@@ -258,10 +258,23 @@ val currentSession: SessionState = sessionStore.get()
 Upgrade existing users smoothly without losing saved tokens or settings. The source `SharedPreferences` is cleared **only after** the encrypted DataStore transaction commits:
 
 ```kotlin
-// Works with plain SharedPreferences or deprecated androidx.security.crypto.EncryptedSharedPreferences
+// Option A: DataStore-integrated migration (runs atomically before first read)
+val authPrefs = EncryptedDataStoreFactory.createPreferences(
+    context = PlatformStorageContext(applicationContext),
+    config = SecurityConfig(storeName = "auth_prefs"),
+    migrations = listOf(
+        SharedPreferencesDataMigration(
+            source = legacyEncryptedPrefs,
+            clearSourceOnSuccess = true,
+        )
+    ),
+)
+
+// Option B: Imperative migration (wipes legacy file only after encrypted write commits)
 val report = authPrefs.migrateFromSharedPreferences(
     source = legacyEncryptedPrefs,
     clearSourceOnSuccess = true,
+    overwriteExisting = false,
 )
 
 // Optional: migrate only specific keys
@@ -322,6 +335,10 @@ val diag: SecurityDiagnostics = authPrefs.diagnostics()
 // 3. Secure logout: overwrites store with default state AND destroys all prior DEKs
 // Even an attacker holding an older disk snapshot cannot decrypt it afterward.
 authPrefs.clearAndReset()
+
+// 4. Escape hatch for permanently invalidated/corrupted STRICT stores:
+// Wipes disk files and keys without attempting to decrypt, then closes this instance.
+brokenStore.forceResetAndClose()
 ```
 
 ---
@@ -346,8 +363,9 @@ val biometricVault = EncryptedDataStoreFactory.createPreferences(
 
 > **Important:**
 > - `authValidityDurationSeconds` must be `> 0` (per-operation `0`-second keys require `BiometricPrompt.CryptoObject`, which DataStore streams do not expose).
-> - When `userAuthConfig` is enabled on Android, the DEK keyset is **not** cached in RAM across operations so the Keystore authentication timeout is genuinely enforced. On iOS, Keychain items use `SecAccessControl` (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).
-> - When the device is locked or the authentication window has expired, operations throw `UserAuthenticationRequiredException`. This transient lock state **never** triggers corruption recovery or store wiping — prompt `BiometricPrompt` and retry.
+> - Because `DataStore` caches decrypted values in RAM once loaded in the active process, `authValidityDurationSeconds` enforces biometric/credential re-authentication on **initial store unlock** and on **subsequent writes or key rotations** after the window expires (and when a fresh store instance is opened), while active `data` / `get()` readers continue receiving the in-memory cached state until the process restarts.
+> - On Android, when `userAuthConfig` is enabled, the DEK keyset is **not** cached in RAM across operations. On iOS, Keychain items use `SecAccessControl` paired with a shared `LAContext` configured with `touchIDAuthenticationAllowableReuseDuration = authValidityDurationSeconds`.
+> - When the device is locked, authentication expired, or the user cancels the biometric prompt (`errSecUserCanceled` on iOS), operations throw `UserAuthenticationRequiredException`. This transient state **never** triggers corruption recovery or store wiping — prompt authentication and retry.
 
 ---
 
@@ -356,7 +374,8 @@ val biometricVault = EncryptedDataStoreFactory.createPreferences(
 Instantiate `PlatformStorageContext` per platform and share your store factory in `commonMain`:
 
 ```kotlin
-// commonMain (use CipherAlgorithm.AES256_GCM when targeting iOS; XCHACHA20_POLY1305 is Android/JVM only)
+// commonMain (uses AES256_GCM on Android/JVM and AES256_CTR_HMAC_SHA256 on iOS by default;
+// pass CipherAlgorithm.AES256_CTR_HMAC_SHA256 explicitly if you need the same algorithm across all platforms)
 class VaultRepository(context: PlatformStorageContext) {
     val prefs = EncryptedDataStoreFactory.createPreferences(
         context = context,
@@ -389,11 +408,11 @@ VaultRepository(
 1. Push changes to `Maignardi/encrypted-datastore`.
 2. Create and push a version tag:
    ```bash
-   git tag 0.1.1
-   git push origin 0.1.1
+   git tag 0.1.2
+   git push origin 0.1.2
    ```
-3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.1.1")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
-4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.1.1`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
+3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.1.2")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
+4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.1.2`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
 
 ---
 
