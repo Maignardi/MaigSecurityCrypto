@@ -1,8 +1,9 @@
-# EncryptedDataStore
+# MaigSecurityCrypto
 
 A modern, security-first **Kotlin Multiplatform (Android, JVM, iOS)** replacement for Android's deprecated `androidx.security:security-crypto` (`EncryptedSharedPreferences` and `EncryptedFile`), built on **Jetpack DataStore (Okio)**, **Google Tink**, **AndroidKeyStore / StrongBox**, and **iOS Keychain**.
 
 - **Minimum Android SDK:** API 23 (Android 6.0+) — StrongBox hardware support on API 28+
+- **Kotlin Package / Android Namespace:** `io.github.maigsecuritycrypto`
 - **Targets:** `android`, `jvm`, `iosArm64`, `iosSimulatorArm64`
 - **License:** Apache 2.0
 
@@ -10,43 +11,44 @@ A modern, security-first **Kotlin Multiplatform (Android, JVM, iOS)** replacemen
 
 ## Table of Contents
 
-- [Why EncryptedDataStore?](#why-encrypteddatastore)
+- [Why MaigSecurityCrypto?](#why-maigsecuritycrypto)
 - [Installation (Direct from GitHub)](#installation-direct-from-github)
   - [Option A: JitPack (Android & JVM)](#option-a-jitpack-android--jvm)
   - [Option B: Version Catalog (`libs.versions.toml`)](#option-b-version-catalog-libsversionstoml)
   - [Option C: GitHub Packages (Full KMP including iOS)](#option-c-github-packages-full-kmp-including-ios)
 - [Tutorials & Usage](#tutorials--usage)
-  - [1. Replacing `EncryptedSharedPreferences` (`EncryptedPreferences`)](#1-replacing-encryptedsharedpreferences-encryptedpreferences)
-  - [2. Using `EncryptedPreferences` in Jetpack Compose](#2-using-encryptedpreferences-in-jetpack-compose)
-  - [3. Typed `@Serializable` Object Store (`EncryptedDataStore<T>`)](#3-typed-serializable-object-store-encrypteddatastoret)
+  - [1. Replacing `EncryptedSharedPreferences` (`MaigEncryptedPreferences`)](#1-replacing-encryptedsharedpreferences-maigencryptedpreferences)
+  - [2. Using `MaigEncryptedPreferences` in Jetpack Compose](#2-using-maigencryptedpreferences-in-jetpack-compose)
+  - [3. Typed `@Serializable` Object Store (`MaigEncryptedDataStore<T>`)](#3-typed-serializable-object-store-maigencrypteddatastoret)
   - [4. Migrating from Legacy `SharedPreferences` / `EncryptedSharedPreferences`](#4-migrating-from-legacy-sharedpreferences--encryptedsharedpreferences)
-  - [5. Choosing a `KeystoreRecoveryPolicy` (OEM Resilience)](#5-choosing-a-keystorerecoverypolicy-oem-resilience)
+  - [5. Choosing a `MaigKeystoreRecoveryPolicy` (OEM Resilience)](#5-choosing-a-maigkeystorerecoverypolicy-oem-resilience)
   - [6. Key Rotation, Auditing Diagnostics & Secure Logout (`clearAndReset`)](#6-key-rotation-auditing-diagnostics--secure-logout-clearandreset)
-  - [7. Biometric & Device Credential Binding (`UserAuthConfig`)](#7-biometric--device-credential-binding-userauthconfig)
+  - [7. Biometric & Device Credential Binding (`MaigUserAuthConfig`)](#7-biometric--device-credential-binding-maiguserauthconfig)
   - [8. Kotlin Multiplatform Setup (Android, iOS & JVM)](#8-kotlin-multiplatform-setup-android-ios--jvm)
-- [Publishing a Release from Your GitHub Repository](#publishing-a-release-from-your-github-repository)
+- [Upgrading from `0.2.x` (`EncryptedDataStore` -> `MaigSecurityCrypto`)](#upgrading-from-02x-encrypteddatastore---maigsecuritycrypto)
+- [Publishing a Release from GitHub](#publishing-a-release-from-github)
 - [FAQ & Best Practices](#faq--best-practices)
 - [Sample App & Running Tests](#sample-app--running-tests)
 
 ---
 
-## Why EncryptedDataStore?
+## Why MaigSecurityCrypto?
 
-- **Drop-in replacement for `EncryptedSharedPreferences`:** Reactive, type-safe `EncryptedPreferences` supporting `String`, `Int`, `Long`, `Float`, `Double`, `Boolean`, `Set<String>`, `ByteArray`, and `@Serializable` objects.
+- **Drop-in replacement for `EncryptedSharedPreferences`:** Reactive, type-safe `MaigEncryptedPreferences` supporting `String`, `Int`, `Long`, `Float`, `Double`, `Boolean`, `Set<String>`, `ByteArray`, and `@Serializable` objects.
 - **Envelope Encryption (KEK + DEK):**
   - **Android:** 256-bit AES-GCM master key in `AndroidKeyStore` (StrongBox on API 28+ with automatic fallback to TEE) wrapping a Google Tink DEK keyset (`AES256_GCM` or `XCHACHA20_POLY1305`).
-  - **iOS:** 256-bit CSPRNG DEKs (`SecRandomCopyBytes`) stored in the iOS Keychain (`*ThisDeviceOnly`) with Apple native AES-GCM via `cryptography-provider-apple`.
+  - **iOS:** 256-bit CSPRNG DEKs (`SecRandomCopyBytes`) stored in the iOS Keychain (`*ThisDeviceOnly`) with `AES256_CTR_HMAC_SHA256` Encrypt-then-MAC via Apple `CommonCrypto` (`cryptography-provider-apple`).
   - **JVM:** Google Tink keyset wrapped with PBKDF2-HMAC-SHA256 (`310,000` iterations) when a passphrase provider is configured, or an isolated local AES-256-GCM KEK.
 - **Authenticated Binary Envelope (`EDST` v1):** Binds the 14-byte header (magic, format version, cipher algorithm, key epoch), domain tag, `storeName`, and optional caller AAD (e.g., `userId`/`tenantId`) into the AEAD Associated Data to block file-swapping, truncation, and algorithm downgrade attacks.
 - **Zero Cloud Backup Leaks by Default:** Stores encrypted files, keysets, and metadata in `noBackupFilesDir` (`0700`/`0600` permissions) on Android, and sets `NSURLIsExcludedFromBackupKey = true` on iOS.
-- **Key Rotation & Secure Wipe:** Supports manual (`rotateKeys()`) and automatic (`KeyRotationPolicy.Automatic` by age or write count) key rotation, plus `clearAndReset()` which destroys historical keys.
+- **Key Rotation & Secure Wipe:** Supports manual (`rotateKeys()`) and automatic (`MaigKeyRotationPolicy.Automatic` by age or write count) key rotation, plus `clearAndReset()` which destroys historical keys.
 - **R8 / ProGuard Ready:** Consumer keep rules (`consumer-rules.pro`) are automatically bundled in the AAR.
 
 ---
 
 ## Installation (Direct from GitHub)
 
-Consumers can add `EncryptedDataStore` via Gradle without cloning this repository locally.
+Consumers can add **MaigSecurityCrypto** via Gradle without cloning this repository locally (Maven artifact coordinates remain `encrypted-datastore`).
 
 ### Option A: JitPack (Android & JVM)
 
@@ -68,7 +70,7 @@ dependencyResolutionManagement {
 **Android app/library (`app/build.gradle.kts`):**
 ```kotlin
 dependencies {
-    implementation("com.github.Maignardi:encrypted-datastore:0.2.2")
+    implementation("com.github.Maignardi:encrypted-datastore:0.3.0")
 }
 ```
 
@@ -78,15 +80,15 @@ dependencies {
 
 ```toml
 [versions]
-encryptedDatastore = "0.2.2"
+maigSecurityCrypto = "0.3.0"
 
 [libraries]
-encrypted-datastore = { module = "com.github.Maignardi:encrypted-datastore", version.ref = "encryptedDatastore" }
+maig-security-crypto = { module = "com.github.Maignardi:encrypted-datastore", version.ref = "maigSecurityCrypto" }
 ```
 
 ```kotlin
 dependencies {
-    implementation(libs.encrypted.datastore)
+    implementation(libs.maig.security.crypto)
 }
 ```
 
@@ -108,7 +110,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.maignardi:encrypted-datastore:0.2.2")
+    implementation("io.github.maignardi:encrypted-datastore:0.3.0")
 }
 ```
 
@@ -116,25 +118,25 @@ dependencies {
 
 ## Tutorials & Usage
 
-### 1. Replacing `EncryptedSharedPreferences` (`EncryptedPreferences`)
+### 1. Replacing `EncryptedSharedPreferences` (`MaigEncryptedPreferences`)
 
 Create **one singleton instance per `storeName`** (e.g., via Hilt, Koin, or an `Application`-scoped property), following Jetpack DataStore's single-instance rule:
 
 ```kotlin
-import io.github.encrypteddatastore.*
+import io.github.maigsecuritycrypto.*
 import kotlin.time.Duration.Companion.days
 
-val authPrefs: EncryptedPreferences = EncryptedDataStoreFactory.createPreferences(
-    context = PlatformStorageContext(applicationContext),
-    config = SecurityConfig(
+val authPrefs: MaigEncryptedPreferences = MaigSecurityCrypto.createPreferences(
+    context = MaigStorageContext(applicationContext),
+    config = MaigSecurityConfig(
         storeName = "auth_prefs",
-        algorithm = CipherAlgorithm.AES256_GCM, // or CipherAlgorithm.XCHACHA20_POLY1305
-        keyRotationPolicy = KeyRotationPolicy.Automatic(
+        algorithm = MaigCipherAlgorithm.AES256_GCM, // or MaigCipherAlgorithm.XCHACHA20_POLY1305
+        keyRotationPolicy = MaigKeyRotationPolicy.Automatic(
             maxKeyAge = 90.days,
             maxWritesBeforeRotation = 100_000L,
             maxRetainedKeys = 2,
         ),
-        recoveryPolicy = KeystoreRecoveryPolicy.STRICT,
+        recoveryPolicy = MaigKeystoreRecoveryPolicy.STRICT,
     ),
 )
 ```
@@ -146,13 +148,13 @@ Define type-safe keys and read/write atomically:
 data class UserProfile(val id: Long, val email: String)
 
 object AuthKeys {
-    val accessToken = PreferenceKeys.string("access_token")
-    val expiresAt = PreferenceKeys.long("expires_at")
-    val loginCount = PreferenceKeys.int("login_count")
-    val biometricEnabled = PreferenceKeys.boolean("biometric_enabled")
-    val scopes = PreferenceKeys.stringSet("scopes")
-    val deviceSeed = PreferenceKeys.byteArray("device_seed")
-    val profile = PreferenceKeys.serializable("profile", UserProfile.serializer())
+    val accessToken = MaigPreferenceKeys.string("access_token")
+    val expiresAt = MaigPreferenceKeys.long("expires_at")
+    val loginCount = MaigPreferenceKeys.int("login_count")
+    val biometricEnabled = MaigPreferenceKeys.boolean("biometric_enabled")
+    val scopes = MaigPreferenceKeys.stringSet("scopes")
+    val deviceSeed = MaigPreferenceKeys.byteArray("device_seed")
+    val profile = MaigPreferenceKeys.serializable("profile", UserProfile.serializer())
 }
 
 // Atomic transactional write
@@ -179,27 +181,27 @@ authPrefs.observe(AuthKeys.accessToken).collect { currentToken ->
 }
 ```
 
-#### All Supported `PreferenceKeys` Builders
+#### All Supported `MaigPreferenceKeys` Builders
 
 | Builder | Kotlin Type |
 | --- | --- |
-| `PreferenceKeys.string(name)` | `String` |
-| `PreferenceKeys.int(name)` | `Int` |
-| `PreferenceKeys.long(name)` | `Long` |
-| `PreferenceKeys.float(name)` | `Float` |
-| `PreferenceKeys.double(name)` | `Double` |
-| `PreferenceKeys.boolean(name)` | `Boolean` |
-| `PreferenceKeys.stringSet(name)` | `Set<String>` |
-| `PreferenceKeys.byteArray(name)` | `ByteArray` |
-| `PreferenceKeys.serializable(name, serializer)` | Any `@Serializable` type `T` |
+| `MaigPreferenceKeys.string(name)` | `String` |
+| `MaigPreferenceKeys.int(name)` | `Int` |
+| `MaigPreferenceKeys.long(name)` | `Long` |
+| `MaigPreferenceKeys.float(name)` | `Float` |
+| `MaigPreferenceKeys.double(name)` | `Double` |
+| `MaigPreferenceKeys.boolean(name)` | `Boolean` |
+| `MaigPreferenceKeys.stringSet(name)` | `Set<String>` |
+| `MaigPreferenceKeys.byteArray(name)` | `ByteArray` |
+| `MaigPreferenceKeys.serializable(name, serializer)` | Any `@Serializable` type `T` |
 
 ---
 
-### 2. Using `EncryptedPreferences` in Jetpack Compose
+### 2. Using `MaigEncryptedPreferences` in Jetpack Compose
 
 ```kotlin
 @Composable
-fun TokenStatusBanner(prefs: EncryptedPreferences) {
+fun TokenStatusBanner(prefs: MaigEncryptedPreferences) {
     val scope = rememberCoroutineScope()
     val token by prefs.observe(AuthKeys.accessToken).collectAsState(initial = null)
 
@@ -214,13 +216,13 @@ fun TokenStatusBanner(prefs: EncryptedPreferences) {
 }
 ```
 
-See [`EncryptedVaultScreen.kt`](sample-android/src/main/kotlin/io/github/encrypteddatastore/sample/EncryptedVaultScreen.kt) for a full working Compose example.
+See [`EncryptedVaultScreen.kt`](sample-android/src/main/kotlin/io/github/maigsecuritycrypto/sample/EncryptedVaultScreen.kt) for a full working Compose example.
 
 ---
 
-### 3. Typed `@Serializable` Object Store (`EncryptedDataStore<T>`)
+### 3. Typed `@Serializable` Object Store (`MaigEncryptedDataStore<T>`)
 
-For structured domain models, use `EncryptedDataStoreFactory.create(...)`. You can also pass `associatedDataProvider` to cryptographically bind ciphertext to a user or tenant ID (preventing cross-account file replay):
+For structured domain models, use `MaigSecurityCrypto.create(...)`. You can also pass `associatedDataProvider` to cryptographically bind ciphertext to a user or tenant ID (preventing cross-account file replay):
 
 ```kotlin
 @Serializable
@@ -230,9 +232,9 @@ data class SessionState(
     val userId: String = "",
 )
 
-val sessionStore = EncryptedDataStoreFactory.create(
-    context = PlatformStorageContext(applicationContext),
-    config = SecurityConfig(
+val sessionStore: MaigEncryptedDataStore<SessionState> = MaigSecurityCrypto.create(
+    context = MaigStorageContext(applicationContext),
+    config = MaigSecurityConfig(
         storeName = "session_state",
         associatedDataProvider = { currentTenantId.encodeToByteArray() },
     ),
@@ -249,7 +251,7 @@ sessionStore.updateData { current ->
 val currentSession: SessionState = sessionStore.get()
 ```
 
-> **Warning on `associatedDataProvider`:** `associatedDataProvider` is evaluated on **every** read and write. Ensure the value it returns is deterministic across app restarts (for example, an already-resolved `userId` or `tenantId`). If the returned bytes differ on a later read, decryption fails with `StoreTamperedOrCorruptedException` — and under `CLEAR_AND_REGENERATE`, that mismatch wipes and resets the store. For per-user isolation across logins, prefer a scoped `storeName` such as `"session_$userId"`.
+> **Warning on `associatedDataProvider`:** `associatedDataProvider` is evaluated on **every** read and write. Ensure the value it returns is deterministic across app restarts (for example, an already-resolved `userId` or `tenantId`). If the returned bytes differ on a later read, decryption fails with `MaigStoreTamperedOrCorruptedException` — and under `CLEAR_AND_REGENERATE`, that mismatch wipes and resets the store. For per-user isolation across logins, prefer a scoped `storeName` such as `"session_$userId"`.
 
 ---
 
@@ -259,11 +261,11 @@ Upgrade existing users smoothly without losing saved tokens or settings. The sou
 
 ```kotlin
 // Option A: DataStore-integrated migration (runs atomically before first read)
-val authPrefs = EncryptedDataStoreFactory.createPreferences(
-    context = PlatformStorageContext(applicationContext),
-    config = SecurityConfig(storeName = "auth_prefs"),
+val authPrefs = MaigSecurityCrypto.createPreferences(
+    context = MaigStorageContext(applicationContext),
+    config = MaigSecurityConfig(storeName = "auth_prefs"),
     migrations = listOf(
-        SharedPreferencesDataMigration(
+        MaigSharedPreferencesDataMigration(
             source = legacyEncryptedPrefs,
             migrationId = "legacy_auth_prefs",
             clearSourceOnSuccess = true,
@@ -272,7 +274,7 @@ val authPrefs = EncryptedDataStoreFactory.createPreferences(
 )
 
 // Option B: Imperative migration (wipes legacy file only after encrypted write commits)
-val report = authPrefs.migrateFromSharedPreferences(
+val report: MaigSharedPreferencesMigrationReport = authPrefs.migrateFromSharedPreferences(
     source = legacyEncryptedPrefs,
     clearSourceOnSuccess = true,
     overwriteExisting = false,
@@ -288,20 +290,20 @@ val partialReport = authPrefs.migrateFromSharedPreferences(
 
 ---
 
-### 5. Choosing a `KeystoreRecoveryPolicy` (OEM Resilience)
+### 5. Choosing a `MaigKeystoreRecoveryPolicy` (OEM Resilience)
 
-Some Android OEMs suffer from `AndroidKeyStore` bugs (keys invalidated after OS updates or unavailable Keystore services). `EncryptedDataStore` never weakens security or wipes data silently — choose the policy that matches your threat model:
+Some Android OEMs suffer from `AndroidKeyStore` bugs (keys invalidated after OS updates or unavailable Keystore services). `MaigSecurityCrypto` never weakens security or wipes data silently — choose the policy that matches your threat model:
 
 | Policy | Behavior on Keystore / File Corruption | Recommended For |
 | --- | --- | --- |
-| `KeystoreRecoveryPolicy.STRICT` *(Default)* | Fails closed by throwing `SecurityStorageException` (`KeystoreUnavailableException` / `StoreTamperedOrCorruptedException`). | High-security secrets, banking/payment tokens where silent resets are unacceptable. |
-| `KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE` | Atomically wipes the corrupted keyset and store file, generates fresh keys, resets to default value, and calls `onRecovery`. | Session caches or tokens where the user can cleanly re-authenticate after OS Keystore corruption. |
-| `KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK` | Explicit opt-in for broken OEM Keystores (cannot be combined with `UserAuthConfig`): derives an app-scoped software KEK via HKDF-SHA256 over an installation-unique CSPRNG secret in `noBackupFilesDir`, and reports `SecurityLevel.SOFTWARE_FALLBACK` in `diagnostics()`. | Non-critical preferences or apps targeting devices with known broken hardware Keystores. |
+| `MaigKeystoreRecoveryPolicy.STRICT` *(Default)* | Fails closed by throwing `MaigSecurityStorageException` (`MaigKeystoreUnavailableException` / `MaigStoreTamperedOrCorruptedException`). | High-security secrets, banking/payment tokens where silent resets are unacceptable. |
+| `MaigKeystoreRecoveryPolicy.CLEAR_AND_REGENERATE` | Atomically wipes the corrupted keyset and store file, generates fresh keys, resets to default value, and calls `onRecovery`. | Session caches or tokens where the user can cleanly re-authenticate after OS Keystore corruption. |
+| `MaigKeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK` | Explicit opt-in for broken OEM Keystores (cannot be combined with `MaigUserAuthConfig`): derives an app-scoped software KEK via HKDF-SHA256 over an installation-unique CSPRNG secret in `noBackupFilesDir`, and reports `MaigSecurityLevel.SOFTWARE_FALLBACK` in `diagnostics()`. | Non-critical preferences or apps targeting devices with known broken hardware Keystores. |
 
 ```kotlin
-val config = SecurityConfig(
+val config = MaigSecurityConfig(
     storeName = "resilient_session",
-    recoveryPolicy = KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE,
+    recoveryPolicy = MaigKeystoreRecoveryPolicy.CLEAR_AND_REGENERATE,
     onRecovery = { event ->
         // Log redacted reason and prompt user to sign in again
         analytics.log("store_reset", mapOf("store" to event.storeName))
@@ -309,9 +311,9 @@ val config = SecurityConfig(
     eventListener = { event ->
         // Redacted audit events (never contain keys or plaintext)
         when (event) {
-            is SecurityEvent.StrongBoxFallbackToTee -> { /* StrongBox unavailable, TEE used */ }
-            is SecurityEvent.KeyRotated -> { /* Key rotated from oldEpoch to newEpoch */ }
-            is SecurityEvent.SoftwareFallbackActivated -> { /* Software fallback active */ }
+            is MaigSecurityEvent.StrongBoxFallbackToTee -> { /* StrongBox unavailable, TEE used */ }
+            is MaigSecurityEvent.KeyRotated -> { /* Key rotated from oldEpoch to newEpoch */ }
+            is MaigSecurityEvent.SoftwareFallbackActivated -> { /* Software fallback active */ }
             else -> Unit
         }
     },
@@ -327,7 +329,7 @@ val config = SecurityConfig(
 val newEpoch: Long = authPrefs.rotateKeys()
 
 // 2. Inspect active security posture (safe for debug panels/telemetry; zero secrets exposed)
-val diag: SecurityDiagnostics = authPrefs.diagnostics()
+val diag: MaigSecurityDiagnostics = authPrefs.diagnostics()
 // diag.securityLevel -> STRONGBOX / HARDWARE_TEE / KEYCHAIN / PASSPHRASE_PBKDF2 / LOCAL_FILE_KEK / SOFTWARE_FALLBACK / UNKNOWN
 // diag.hardwareBacked -> true on Android StrongBox/TEE; false on software fallback, JVM, or iOS Keychain (DEK used in app memory)
 // diag.currentKeyEpoch -> 2
@@ -344,16 +346,16 @@ brokenStore.forceResetAndClose()
 
 ---
 
-### 7. Biometric & Device Credential Binding (`UserAuthConfig`)
+### 7. Biometric & Device Credential Binding (`MaigUserAuthConfig`)
 
 Bind the AndroidKeyStore master key to recent biometric or lockscreen authentication:
 
 ```kotlin
-val biometricVault = EncryptedDataStoreFactory.createPreferences(
-    context = PlatformStorageContext(applicationContext),
-    config = SecurityConfig(
+val biometricVault = MaigSecurityCrypto.createPreferences(
+    context = MaigStorageContext(applicationContext),
+    config = MaigSecurityConfig(
         storeName = "biometric_vault",
-        userAuthConfig = UserAuthConfig(
+        userAuthConfig = MaigUserAuthConfig(
             authValidityDurationSeconds = 30,
             allowDeviceCredential = true,
             invalidateOnBiometricEnrollment = true,
@@ -366,36 +368,36 @@ val biometricVault = EncryptedDataStoreFactory.createPreferences(
 > - `authValidityDurationSeconds` must be `> 0` (per-operation `0`-second keys require `BiometricPrompt.CryptoObject`, which DataStore streams do not expose).
 > - Because `DataStore` caches decrypted values in RAM once loaded in the active process, `authValidityDurationSeconds` enforces biometric/credential re-authentication on **initial store unlock** and on **subsequent writes or key rotations** after the window expires (and when a fresh store instance is opened), while active `data` / `get()` readers continue receiving the in-memory cached state until the process restarts.
 > - On Android, when `userAuthConfig` is enabled, the DEK keyset is **not** cached in RAM across operations. On iOS, Keychain items use `SecAccessControl` paired with a shared `LAContext` configured with `touchIDAuthenticationAllowableReuseDuration = authValidityDurationSeconds`.
-> - When the device is locked, authentication expired, or the user cancels the biometric prompt (`errSecUserCanceled` on iOS), operations throw `UserAuthenticationRequiredException`. This transient state **never** triggers corruption recovery or store wiping — prompt authentication and retry.
+> - When the device is locked, authentication expired, or the user cancels the biometric prompt (`errSecUserCanceled` on iOS), operations throw `MaigUserAuthenticationRequiredException`. This transient state **never** triggers corruption recovery or store wiping — prompt authentication and retry.
 
 ---
 
 ### 8. Kotlin Multiplatform Setup (Android, iOS & JVM)
 
-Instantiate `PlatformStorageContext` per platform and share your store factory in `commonMain`:
+Instantiate `MaigStorageContext` per platform and share your store factory in `commonMain`:
 
 ```kotlin
 // commonMain (uses AES256_GCM on Android/JVM and AES256_CTR_HMAC_SHA256 on iOS by default;
-// pass CipherAlgorithm.AES256_CTR_HMAC_SHA256 explicitly if you need the same algorithm across all platforms)
-class VaultRepository(context: PlatformStorageContext) {
-    val prefs = EncryptedDataStoreFactory.createPreferences(
+// pass MaigCipherAlgorithm.AES256_CTR_HMAC_SHA256 explicitly if you need the same algorithm across all platforms)
+class VaultRepository(context: MaigStorageContext) {
+    val prefs = MaigSecurityCrypto.createPreferences(
         context = context,
-        config = SecurityConfig(
+        config = MaigSecurityConfig(
             storeName = "shared_vault",
-            iosAccessibility = IosKeychainAccessibility.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+            iosAccessibility = MaigIosKeychainAccessibility.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
         ),
     )
 }
 
 // androidMain
-VaultRepository(PlatformStorageContext(applicationContext))
+VaultRepository(MaigStorageContext(applicationContext))
 
 // iosMain
-VaultRepository(PlatformStorageContext())
+VaultRepository(MaigStorageContext())
 
 // jvmMain (optionally protect the Tink keyset with a PBKDF2 passphrase)
 VaultRepository(
-    PlatformStorageContext(
+    MaigStorageContext(
         storageDirectory = File(System.getProperty("user.home"), ".myapp"),
         masterPassphraseProvider = { promptPassphrase() },
     )
@@ -404,23 +406,32 @@ VaultRepository(
 
 ---
 
+## Upgrading from `0.2.x` (`EncryptedDataStore` -> `MaigSecurityCrypto`)
+
+In `0.3.0`, the library was branded as **MaigSecurityCrypto**:
+- Gradle/Maven coordinates (`com.github.Maignardi:encrypted-datastore` and `io.github.maignardi:encrypted-datastore`) stay unchanged.
+- Existing `.edst` encrypted files, `AndroidKeyStore` aliases, and iOS Keychain items stay **100% compatible** — users upgrading in-place keep all stored data.
+- Update imports from `io.github.encrypteddatastore.*` to `io.github.maigsecuritycrypto.*` and rename public symbols (`EncryptedDataStoreFactory` -> `MaigSecurityCrypto`, `EncryptedPreferences` -> `MaigEncryptedPreferences`, `EncryptedDataStore` -> `MaigEncryptedDataStore`, `SecurityConfig` -> `MaigSecurityConfig`, `PlatformStorageContext` -> `MaigStorageContext`, etc.).
+
+---
+
 ## Publishing a Release from GitHub
 
 1. Push changes to `Maignardi/encrypted-datastore`.
 2. Create and push a version tag:
    ```bash
-   git tag 0.2.2
-   git push origin 0.2.2
+   git tag 0.3.0
+   git push origin 0.3.0
    ```
-3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.2.2")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
-4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.2.2`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
+3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.3.0")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
+4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.3.0`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
 
 ---
 
 ## FAQ & Best Practices
 
 - **Why do I get `IllegalStateException: There are multiple DataStores active for the same file`?**
-  Jetpack DataStore requires a single active instance per file path per process. Create each `EncryptedDataStore` / `EncryptedPreferences` once as a singleton (Hilt `@Singleton`, Koin `single`, or `object` / `Application` property). In unit tests that reopen the same store path, call `suspend fun close()` before creating a new instance.
+  Jetpack DataStore requires a single active instance per file path per process. Create each `MaigEncryptedDataStore` / `MaigEncryptedPreferences` once as a singleton (Hilt `@Singleton`, Koin `single`, or `object` / `Application` property). In unit tests that reopen the same store path, call `suspend fun close()` before creating a new instance.
 - **Do I need extra ProGuard / R8 rules?**
   No. [`consumer-rules.pro`](encrypted-datastore/consumer-rules.pro) is embedded inside the published AAR (`proguard.txt`) and applied automatically in release builds.
 - **Are files excluded from Android Auto Backup?**
@@ -434,7 +445,7 @@ VaultRepository(
 - Run the full verification suite:
 
 ```bash
-./gradlew :encrypted-datastore:jvmTest :encrypted-datastore:testAndroidHostTest :sample-android:testDebugUnitTest
+./gradlew :encrypted-datastore:jvmTest :encrypted-datastore:testAndroidHostTest :encrypted-datastore:verifyAndroidMinSdk23Compatibility :sample-android:testDebugUnitTest
 ```
 
 See [`SECURITY.md`](SECURITY.md) for the cryptographic specification, envelope layout, and threat model.

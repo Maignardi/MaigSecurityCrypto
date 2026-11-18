@@ -1,0 +1,304 @@
+package io.github.maigsecuritycrypto
+
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
+import android.security.keystore.KeyProperties
+import android.security.keystore.UserNotAuthenticatedException
+import com.google.crypto.tink.Aead
+import java.security.GeneralSecurityException
+import java.security.InvalidKeyException
+import java.security.KeyStore
+import java.security.KeyStoreException
+import java.security.MessageDigest
+import java.security.ProviderException
+import java.security.UnrecoverableKeyException
+import javax.crypto.AEADBadTagException
+import javax.crypto.Cipher
+import javax.crypto.IllegalBlockSizeException
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+
+/**
+ * Hardware-backed AndroidKeyStore AES-256-GCM AEAD wrapper used as the Key Encryption Key (KEK)
+ * to wrap/unwrap the Tink DEK keyset.
+ *
+ * All KeyStore accesses are serialized through [keyStoreLock] to avoid race conditions
+ * observed on several OEM AndroidKeyStore implementations.
+ */
+internal class AndroidKeyStoreAead(
+    private val context: Context,
+    private val config: MaigSecurityConfig,
+) : Aead {
+
+    companion object {
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private const val TRANSFORMATION = "AES/GCM/NoPadding"
+        private const val GCM_TAG_BITS = 128
+        private val keyStoreLock = Any()
+
+        internal fun buildAlias(packageName: String, storeName: String): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest("$packageName:$storeName".encodeToByteArray())
+            val hex = digest.joinToString("") { "%02x".format(it) }
+            return "edst_mk_${hex.take(24)}"
+        }
+    }
+
+    internal val alias: String = buildAlias(context.packageName, config.storeName)
+
+    @Volatile
+    private var detectedSecurityLevel: MaigSecurityLevel = MaigSecurityLevel.UNKNOWN
+
+    fun ensureKeyAndGetSecurityLevel(): MaigSecurityLevel = synchronized(keyStoreLock) {
+        try {
+            val key = getOrCreateSecretKeyLocked()
+            detectSecurityLevelLocked(key)
+        } catch (t: Throwable) {
+            throw classifyAndroidKeyStoreError("init", t)
+        }
+    }
+
+    override fun encrypt(plaintext: ByteArray, associatedData: ByteArray): ByteArray {
+        return try {
+            synchronized(keyStoreLock) {
+                val key = getOrCreateSecretKeyLocked()
+                val cipher = Cipher.getInstance(TRANSFORMATION)
+                cipher.init(Cipher.ENCRYPT_MODE, key)
+                if (associatedData.isNotEmpty()) {
+                    cipher.updateAAD(associatedData)
+                }
+                val iv = cipher.iv
+                if (iv == null || iv.size !in 12..16) {
+                    throw MaigEncryptionException("Unexpected GCM IV length from AndroidKeyStore: ${iv?.size}")
+                }
+                val encrypted = cipher.doFinal(plaintext)
+                val output = ByteArray(1 + iv.size + encrypted.size)
+                output[0] = iv.size.toByte()
+                iv.copyInto(output, destinationOffset = 1)
+                encrypted.copyInto(output, destinationOffset = 1 + iv.size)
+                output
+            }
+        } catch (t: Throwable) {
+            throw classifyAndroidKeyStoreError("encrypt", t)
+        }
+    }
+
+    override fun decrypt(ciphertext: ByteArray, associatedData: ByteArray): ByteArray {
+        if (ciphertext.size < 1 + 12 + 16) {
+            throw MaigStoreTamperedOrCorruptedException("Keystore ciphertext is truncated")
+        }
+        val ivLen = ciphertext[0].toInt() and 0xFF
+        if (ivLen !in 12..16 || ciphertext.size <= 1 + ivLen + 16) {
+            throw MaigStoreTamperedOrCorruptedException("Invalid Keystore IV framing")
+        }
+        val iv = ciphertext.copyOfRange(1, 1 + ivLen)
+        val payload = ciphertext.copyOfRange(1 + ivLen, ciphertext.size)
+
+        return try {
+            synchronized(keyStoreLock) {
+                val key = getExistingSecretKeyLocked()
+                    ?: throw MaigKeystoreUnavailableException("Master key '$alias' not found in AndroidKeyStore")
+                val cipher = Cipher.getInstance(TRANSFORMATION)
+                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
+                if (associatedData.isNotEmpty()) {
+                    cipher.updateAAD(associatedData)
+                }
+                cipher.doFinal(payload)
+            }
+        } catch (t: Throwable) {
+            throw classifyAndroidKeyStoreError("decrypt", t)
+        }
+    }
+
+    fun deleteMasterKey() = synchronized(keyStoreLock) {
+        try {
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (ks.containsAlias(alias)) {
+                ks.deleteEntry(alias)
+            }
+            detectedSecurityLevel = MaigSecurityLevel.UNKNOWN
+        } catch (t: Throwable) {
+            throw classifyAndroidKeyStoreError("delete", t)
+        }
+    }
+
+    private fun getExistingSecretKeyLocked(): SecretKey? {
+        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        val entry = ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry
+        return entry?.secretKey
+    }
+
+    private fun getOrCreateSecretKeyLocked(): SecretKey {
+        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        val existing = (ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+        if (existing != null) {
+            return existing
+        }
+
+        val tryStrongBox = config.preferStrongBox &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+            context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
+
+        if (tryStrongBox) {
+            try {
+                return generateKey(useStrongBox = true).also {
+                    detectedSecurityLevel = detectSecurityLevelLocked(it)
+                }
+            } catch (e: Throwable) {
+                if (isUserAuthError(e)) {
+                    throw classifyAndroidKeyStoreError("generate_strongbox", e)
+                }
+                // Many OEMs throw generic ProviderException or KeyStoreException when StrongBox fails.
+                if (isStrongBoxFallbackCandidate(e)) {
+                    config.eventListener?.onEvent(
+                        MaigSecurityEvent.StrongBoxFallbackToTee(
+                            storeName = config.storeName,
+                            reason = e.message ?: e::class.simpleName ?: "strongbox_unavailable",
+                        )
+                    )
+                } else {
+                    throw classifyAndroidKeyStoreError("generate_strongbox", e)
+                }
+            }
+        }
+
+        return generateKey(useStrongBox = false).also {
+            detectedSecurityLevel = detectSecurityLevelLocked(it)
+        }
+    }
+
+    private fun generateKey(useStrongBox: Boolean): SecretKey {
+        val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        val specBuilder = KeyGenParameterSpec.Builder(
+            alias,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .setRandomizedEncryptionRequired(true)
+
+        if (useStrongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Api28KeyStoreImpl.setIsStrongBoxBacked(specBuilder, true)
+        }
+
+        config.userAuthConfig?.let { auth ->
+            specBuilder.setUserAuthenticationRequired(true)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Api30KeyStoreImpl.setUserAuthenticationParameters(
+                    builder = specBuilder,
+                    timeoutSeconds = auth.authValidityDurationSeconds,
+                    allowDeviceCredential = auth.allowDeviceCredential,
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                specBuilder.setUserAuthenticationValidityDurationSeconds(auth.authValidityDurationSeconds)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                Api24KeyStoreImpl.setInvalidatedByBiometricEnrollment(
+                    builder = specBuilder,
+                    invalidate = auth.invalidateOnBiometricEnrollment,
+                )
+            }
+        }
+
+        keyGenerator.init(specBuilder.build())
+        return keyGenerator.generateKey()
+    }
+
+    private fun detectSecurityLevelLocked(key: SecretKey): MaigSecurityLevel {
+        if (detectedSecurityLevel != MaigSecurityLevel.UNKNOWN) {
+            return detectedSecurityLevel
+        }
+        val resolved = try {
+            val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
+            val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                Api31KeyStoreImpl.resolveSecurityLevel(info)
+            } else {
+                @Suppress("DEPRECATION")
+                if (info.isInsideSecureHardware) MaigSecurityLevel.HARDWARE_TEE else MaigSecurityLevel.SOFTWARE_FALLBACK
+            }
+        } catch (_: Throwable) {
+            MaigSecurityLevel.UNKNOWN
+        }
+        detectedSecurityLevel = resolved
+        return resolved
+    }
+
+    private fun isStrongBoxFallbackCandidate(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                Api28KeyStoreImpl.isStrongBoxUnavailableException(cur)
+            ) {
+                return true
+            }
+            if (cur is ProviderException || cur is KeyStoreException) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private fun isUserAuthError(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            if (cur is UserNotAuthenticatedException) return true
+            if (cur.message?.contains("user not authenticated", ignoreCase = true) == true) return true
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private fun classifyAndroidKeyStoreError(op: String, t: Throwable): MaigSecurityStorageException {
+        if (t is MaigSecurityStorageException) return t
+        if (isUserAuthError(t)) {
+            return MaigUserAuthenticationRequiredException(
+                "User authentication required to $op key for '${config.storeName}'",
+                t,
+            )
+        }
+        if (t is android.security.keystore.KeyPermanentlyInvalidatedException ||
+            t.cause is android.security.keystore.KeyPermanentlyInvalidatedException
+        ) {
+            return MaigKeyPermanentlyInvalidatedException(
+                "Hardware key permanently invalidated for '${config.storeName}'",
+                t,
+            )
+        }
+        if (t is AEADBadTagException || t.cause is AEADBadTagException) {
+            return MaigStoreTamperedOrCorruptedException(
+                "AndroidKeyStore AEAD tag mismatch during $op for '${config.storeName}'",
+                t,
+            )
+        }
+        if (t is IllegalBlockSizeException && config.userAuthConfig != null) {
+            return MaigUserAuthenticationRequiredException(
+                "User authentication required or key locked during $op for '${config.storeName}'",
+                t,
+            )
+        }
+        if (t is UnrecoverableKeyException ||
+            t is InvalidKeyException ||
+            t is KeyStoreException ||
+            t is ProviderException ||
+            t is GeneralSecurityException
+        ) {
+            return MaigKeystoreUnavailableException(
+                "AndroidKeyStore failed during $op for '${config.storeName}': ${t.message}",
+                t,
+            )
+        }
+        return MaigKeystoreUnavailableException(
+            "Unexpected AndroidKeyStore failure during $op for '${config.storeName}'",
+            t,
+        )
+    }
+}

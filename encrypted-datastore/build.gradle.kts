@@ -22,7 +22,7 @@ val resolvedGroup = providers.gradleProperty("group").orNull
 val resolvedVersion = providers.gradleProperty("version").orNull
     ?.takeIf { it.isNotBlank() && it != "unspecified" }
     ?: System.getenv("VERSION")?.takeIf { it.isNotBlank() }
-    ?: "0.2.2"
+    ?: "0.3.0"
 
 group = resolvedGroup
 version = resolvedVersion
@@ -41,7 +41,7 @@ kotlin {
     }
 
     android {
-        namespace = "io.github.encrypteddatastore"
+        namespace = "io.github.maigsecuritycrypto"
         compileSdk = 35
         minSdk = 23
 
@@ -166,7 +166,7 @@ val verifyAndroidMinSdk23Compatibility = tasks.register("verifyAndroidMinSdk23Co
             "kotlinx.*",
             "kotlin.*",
             "okio.*",
-            "io.github.encrypteddatastore.*",
+            "io.github.maigsecuritycrypto.*",
             "org.jetbrains.*",
         )
         val checker = signatureFile.inputStream().use { sigStream ->
@@ -221,9 +221,9 @@ publishing {
 
     publications.withType<MavenPublication>().configureEach {
         pom {
-            name.set("EncryptedDataStore")
+            name.set("MaigSecurityCrypto")
             description.set(
-                "Security-first Kotlin Multiplatform encrypted DataStore & EncryptedPreferences " +
+                "MaigSecurityCrypto: security-first Kotlin Multiplatform encrypted DataStore & Preferences " +
                     "built on Jetpack DataStore, Google Tink, AndroidKeyStore/StrongBox, and iOS Keychain."
             )
             licenses {

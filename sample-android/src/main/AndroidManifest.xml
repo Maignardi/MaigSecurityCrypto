@@ -3,7 +3,7 @@
     <application
         android:name=".SampleApplication"
         android:allowBackup="false"
-        android:label="EncryptedDataStore Sample">
+        android:label="MaigSecurityCrypto Sample">
         <activity
             android:name=".MainActivity"
             android:exported="true">

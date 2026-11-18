@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "io.github.encrypteddatastore.sample"
+    namespace = "io.github.maigsecuritycrypto.sample"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "io.github.encrypteddatastore.sample"
+        applicationId = "io.github.maigsecuritycrypto.sample"
         minSdk = 23
         targetSdk = 35
         versionCode = 1

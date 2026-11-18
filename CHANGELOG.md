@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-11-18
+
+### Breaking Changes (Rebrand to MaigSecurityCrypto)
+- **Library renamed to `MaigSecurityCrypto`:**
+  - Kotlin package & Android `namespace` changed from `io.github.encrypteddatastore` to `io.github.maigsecuritycrypto`.
+  - Public API classes renamed/prefixed for clarity:
+    - `EncryptedDataStoreFactory` -> `MaigSecurityCrypto`
+    - `EncryptedDataStore<T>` -> `MaigEncryptedDataStore<T>`
+    - `EncryptedPreferences` / `EncryptedPreferencesSnapshot` / `MutableEncryptedPreferences` / `EncryptedPreferencesMigration` -> `MaigEncryptedPreferences` / `MaigEncryptedPreferencesSnapshot` / `MaigMutableEncryptedPreferences` / `MaigEncryptedPreferencesMigration`
+    - `PreferenceKey` / `PreferenceKeys` -> `MaigPreferenceKey` / `MaigPreferenceKeys`
+    - `PlatformStorageContext` -> `MaigStorageContext`
+    - `SharedPreferencesDataMigration` / `SharedPreferencesMigrationReport` -> `MaigSharedPreferencesDataMigration` / `MaigSharedPreferencesMigrationReport`
+    - `SecurityConfig`, `CipherAlgorithm`, `KeystoreRecoveryPolicy`, `KeyRotationPolicy`, `SecurityLevel`, `UserAuthConfig`, `IosKeychainAccessibility`, `RecoveryEvent`, `SecurityEvent`, `SecurityEventListener`, `SecurityDiagnostics` -> `Maig*` prefixed equivalents
+    - `SecurityStorageException` and subclasses -> `Maig*` prefixed equivalents
+  - Gradle/Maven coordinates (`com.github.Maignardi:encrypted-datastore` on JitPack, `io.github.maignardi:encrypted-datastore` on GitHub Packages) remain unchanged.
+  - On-disk `.edst` envelope format, `AndroidKeyStore` aliases, and iOS Keychain service identifiers are preserved for seamless upgrades from `0.2.x`.
+
+### Fixed
+- **Documentation:** Clarified in `README.md` that iOS uses `AES256_CTR_HMAC_SHA256` Encrypt-then-MAC via Apple `CommonCrypto` (`cryptography-provider-apple`).
+
 ## [0.2.2] - 2026-11-18
 
 ### Fixed
