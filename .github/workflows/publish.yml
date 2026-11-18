@@ -29,4 +29,5 @@ jobs:
           OWNER_LOWER="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
           ./gradlew :MaigSecurityCrypto:publishAllPublicationsToGitHubPackagesRepository \
             -Pgroup="io.github.${OWNER_LOWER}" \
+            -PartifactId="maigsecuritycrypto" \
             -Pversion="$TAG_VERSION"

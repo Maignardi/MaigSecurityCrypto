@@ -70,17 +70,17 @@ dependencyResolutionManagement {
 **Android app/library (`app/build.gradle.kts`):**
 ```kotlin
 dependencies {
-    implementation("com.github.Maignardi:MaigSecurityCrypto:0.3.1")
+    implementation("com.github.Maignardi:MaigSecurityCrypto:0.3.2")
 }
 ```
 
-> **Note for Kotlin Multiplatform (`ios` + `android` + `jvm`):** JitPack builds on Linux and publishes Android and JVM artifacts only. If your KMP `commonMain` targets iOS as well, use **GitHub Packages** (Option C below) or depend on `com.github.Maignardi:MaigSecurityCrypto:0.3.1` inside `androidMain` / `jvmMain` when using JitPack.
+> **Note for Kotlin Multiplatform (`ios` + `android` + `jvm`):** JitPack builds on Linux and publishes Android and JVM artifacts only. If your KMP `commonMain` targets iOS as well, use **GitHub Packages** (Option C below) or depend on `com.github.Maignardi:MaigSecurityCrypto:0.3.2` inside `androidMain` / `jvmMain` when using JitPack.
 
 ### Option B: Version Catalog (`libs.versions.toml`)
 
 ```toml
 [versions]
-maigSecurityCrypto = "0.3.1"
+maigSecurityCrypto = "0.3.2"
 
 [libraries]
 maig-security-crypto = { module = "com.github.Maignardi:MaigSecurityCrypto", version.ref = "maigSecurityCrypto" }
@@ -94,7 +94,7 @@ dependencies {
 
 ### Option C: GitHub Packages (Full KMP including iOS)
 
-Tagging `v*` triggers [`.github/workflows/publish.yml`](.github/workflows/publish.yml) to publish Android, JVM, and iOS artifacts to GitHub Packages:
+Tagging `v*` triggers [`.github/workflows/publish.yml`](.github/workflows/publish.yml) to publish Android, JVM, and iOS artifacts to GitHub Packages (note: GitHub Packages Maven requires a lowercase `artifactId`, so use `maigsecuritycrypto`):
 
 ```kotlin
 repositories {
@@ -110,7 +110,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.maignardi:MaigSecurityCrypto:0.3.1")
+    implementation("io.github.maignardi:maigsecuritycrypto:0.3.2")
 }
 ```
 
@@ -409,7 +409,7 @@ VaultRepository(
 ## Upgrading from `0.2.x` (`EncryptedDataStore` -> `MaigSecurityCrypto`)
 
 In `0.3.x`, the library was renamed to **MaigSecurityCrypto**:
-- Starting in `0.3.1`, update the repository/Gradle coordinates to `com.github.Maignardi:MaigSecurityCrypto:0.3.1` (JitPack) or `io.github.maignardi:MaigSecurityCrypto:0.3.1` (GitHub Packages).
+- Starting in `0.3.2`, use `com.github.Maignardi:MaigSecurityCrypto:0.3.2` on **JitPack** or `io.github.maignardi:maigsecuritycrypto:0.3.2` on **GitHub Packages**.
 - Existing `.edst` encrypted files, `AndroidKeyStore` aliases, and iOS Keychain items stay **100% compatible** — users upgrading in-place keep all stored data.
 - Update imports from `io.github.encrypteddatastore.*` to `io.github.maigsecuritycrypto.*` and rename public symbols (`EncryptedDataStoreFactory` -> `MaigSecurityCrypto`, `EncryptedPreferences` -> `MaigEncryptedPreferences`, `EncryptedDataStore` -> `MaigEncryptedDataStore`, `SecurityConfig` -> `MaigSecurityConfig`, `PlatformStorageContext` -> `MaigStorageContext`, etc.).
 
@@ -420,11 +420,11 @@ In `0.3.x`, the library was renamed to **MaigSecurityCrypto**:
 1. Push changes to `Maignardi/MaigSecurityCrypto`.
 2. Create and push a version tag:
    ```bash
-   git tag 0.3.1
-   git push origin 0.3.1
+   git tag 0.3.2
+   git push origin 0.3.2
    ```
-3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:MaigSecurityCrypto:0.3.1")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
-4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.3.1`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
+3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:MaigSecurityCrypto:0.3.2")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
+4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.3.2`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
 
 ---
 

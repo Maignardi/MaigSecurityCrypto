@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-11-18
+
+### Fixed
+- **GitHub Packages Maven publication (`publish.yml`):** Added configurable `-PartifactId` support in `MaigSecurityCrypto/build.gradle.kts` and passed `-PartifactId=maigsecuritycrypto` in `.github/workflows/publish.yml` because GitHub Packages Maven Registry requires lowercase `artifactId` (`io.github.maignardi:maigsecuritycrypto:0.3.2`), while JitPack continues publishing `com.github.Maignardi:MaigSecurityCrypto:0.3.2`.
+
 ## [0.3.1] - 2026-11-18
 
 ### Breaking Changes

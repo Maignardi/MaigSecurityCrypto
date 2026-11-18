@@ -22,7 +22,10 @@ val resolvedGroup = providers.gradleProperty("group").orNull
 val resolvedVersion = providers.gradleProperty("version").orNull
     ?.takeIf { it.isNotBlank() && it != "unspecified" }
     ?: System.getenv("VERSION")?.takeIf { it.isNotBlank() }
-    ?: "0.3.1"
+    ?: "0.3.2"
+
+val resolvedArtifactBase = providers.gradleProperty("artifactId").orNull
+    ?.takeIf { it.isNotBlank() && it != "unspecified" }
 
 group = resolvedGroup
 version = resolvedVersion
@@ -220,6 +223,10 @@ publishing {
     }
 
     publications.withType<MavenPublication>().configureEach {
+        if (resolvedArtifactBase != null) {
+            val targetSuffix = if (name == "kotlinMultiplatform") "" else "-${name.lowercase()}"
+            artifactId = "$resolvedArtifactBase$targetSuffix"
+        }
         pom {
             name.set("MaigSecurityCrypto")
             description.set(
