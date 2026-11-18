@@ -1,6 +1,8 @@
 package io.github.encrypteddatastore
 
 import android.content.SharedPreferences
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Summary of a migration from legacy [SharedPreferences] / `EncryptedSharedPreferences`.
@@ -8,36 +10,45 @@ import android.content.SharedPreferences
 public data class SharedPreferencesMigrationReport(
     public val migratedKeys: Int,
     public val skippedUnsupportedKeys: Set<String>,
+    public val skippedExistingKeys: Set<String>,
     public val sourceCleared: Boolean,
 )
 
 /**
- * Atomically migrates entries from a legacy [SharedPreferences] (including deprecated
+ * Migrates entries from a legacy [SharedPreferences] (including deprecated
  * `androidx.security.crypto.EncryptedSharedPreferences`) into this [EncryptedPreferences].
  *
- * The source [SharedPreferences] is only cleared (when [clearSourceOnSuccess] is `true`)
- * after the encrypted DataStore commit completes successfully.
+ * Disk I/O on [source] executes on [Dispatchers.IO].
+ * By default ([overwriteExisting] = `false`), keys that already exist in [EncryptedPreferences]
+ * are preserved so repeated invocations remain idempotent even if [clearSourceOnSuccess] is `false`.
  */
 public suspend fun EncryptedPreferences.migrateFromSharedPreferences(
     source: SharedPreferences,
     keysToMigrate: Set<String>? = null,
     clearSourceOnSuccess: Boolean = true,
+    overwriteExisting: Boolean = false,
 ): SharedPreferencesMigrationReport {
-    val allEntries = source.all
+    val allEntries = withContext(Dispatchers.IO) { source.all }
     if (allEntries.isEmpty()) {
         return SharedPreferencesMigrationReport(
             migratedKeys = 0,
             skippedUnsupportedKeys = emptySet(),
+            skippedExistingKeys = emptySet(),
             sourceCleared = false,
         )
     }
 
-    val skipped = mutableSetOf<String>()
+    val skippedUnsupported = mutableSetOf<String>()
+    val skippedExisting = mutableSetOf<String>()
     var migratedCount = 0
 
     edit { prefs ->
         for ((key, value) in allEntries) {
             if (keysToMigrate != null && key !in keysToMigrate) continue
+            if (!overwriteExisting && prefs.containsName(key)) {
+                skippedExisting += key
+                continue
+            }
             when (value) {
                 is String -> {
                     prefs[PreferenceKeys.string(key)] = value
@@ -65,28 +76,31 @@ public suspend fun EncryptedPreferences.migrateFromSharedPreferences(
                         prefs[PreferenceKeys.stringSet(key)] = (value as Set<String>).toSet()
                         migratedCount++
                     } else {
-                        skipped += key
+                        skippedUnsupported += key
                     }
                 }
-                else -> skipped += key
+                else -> skippedUnsupported += key
             }
         }
     }
 
     var cleared = false
     if (clearSourceOnSuccess) {
-        cleared = if (keysToMigrate == null) {
-            source.edit().clear().commit()
-        } else {
-            source.edit().apply {
-                keysToMigrate.forEach { remove(it) }
-            }.commit()
+        cleared = withContext(Dispatchers.IO) {
+            if (keysToMigrate == null) {
+                source.edit().clear().commit()
+            } else {
+                source.edit().apply {
+                    keysToMigrate.forEach { remove(it) }
+                }.commit()
+            }
         }
     }
 
     return SharedPreferencesMigrationReport(
         migratedKeys = migratedCount,
-        skippedUnsupportedKeys = skipped.toSet(),
+        skippedUnsupportedKeys = skippedUnsupported.toSet(),
+        skippedExistingKeys = skippedExisting.toSet(),
         sourceCleared = cleared,
     )
 }

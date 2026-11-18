@@ -6,4 +6,3 @@
 -keepclassmembers class io.github.encrypteddatastore.PreferenceValueType {
     <fields>;
 }
--keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod

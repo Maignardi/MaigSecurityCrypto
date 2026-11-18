@@ -1,5 +1,6 @@
 package io.github.encrypteddatastore
 
+import androidx.datastore.core.DataMigration
 import androidx.datastore.core.DataStoreFactory
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.core.okio.OkioStorage
@@ -29,6 +30,7 @@ public object EncryptedDataStoreFactory {
         serializer: KSerializer<T>,
         defaultValue: () -> T,
         json: Json = defaultJson,
+        migrations: List<DataMigration<T>> = emptyList(),
         scope: CoroutineScope = defaultIoCoroutineScope(),
     ): EncryptedDataStore<T> {
         val keyManager = createPlatformKeyManager(context, config)
@@ -48,6 +50,17 @@ public object EncryptedDataStoreFactory {
         } else {
             null
         }
+        val boxMigrations = migrations.map { userMigration ->
+            object : DataMigration<EncryptedBox<T>> {
+                override suspend fun shouldMigrate(currentData: EncryptedBox<T>): Boolean =
+                    userMigration.shouldMigrate(currentData.value)
+
+                override suspend fun migrate(currentData: EncryptedBox<T>): EncryptedBox<T> =
+                    currentData.copy(value = userMigration.migrate(currentData.value))
+
+                override suspend fun cleanUp() = userMigration.cleanUp()
+            }
+        }
         val storage = OkioStorage(
             fileSystem = fileSystem,
             serializer = okioSerializer,
@@ -59,6 +72,7 @@ public object EncryptedDataStoreFactory {
         val internalStore = DataStoreFactory.create(
             storage = storage,
             corruptionHandler = corruptionHandler,
+            migrations = boxMigrations,
             scope = storeScope,
         )
         return EncryptedDataStore(

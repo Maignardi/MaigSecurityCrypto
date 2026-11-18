@@ -10,12 +10,12 @@ plugins {
 val resolvedGroup = providers.gradleProperty("group").orNull
     ?.takeIf { it.isNotBlank() && it != "unspecified" }
     ?: System.getenv("GROUP")?.takeIf { it.isNotBlank() }
-    ?: "io.github.encrypteddatastore"
+    ?: "io.github.maignardi"
 
 val resolvedVersion = providers.gradleProperty("version").orNull
     ?.takeIf { it.isNotBlank() && it != "unspecified" }
     ?: System.getenv("VERSION")?.takeIf { it.isNotBlank() }
-    ?: "0.1.0"
+    ?: "0.1.1"
 
 group = resolvedGroup
 version = resolvedVersion
@@ -61,7 +61,6 @@ kotlin {
 
     iosArm64()
     iosSimulatorArm64()
-    iosX64()
 
     sourceSets {
         commonMain.dependencies {
@@ -89,7 +88,6 @@ kotlin {
             implementation(libs.asm.commons)
             implementation(libs.asm.tree)
             implementation(libs.androidx.test.core)
-            implementation(libs.tink.jvm)
         }
 
         jvmMain.dependencies {

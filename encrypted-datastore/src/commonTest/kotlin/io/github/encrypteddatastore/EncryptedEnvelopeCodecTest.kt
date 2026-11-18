@@ -117,17 +117,32 @@ class SecurityConfigTest {
             KeyRotationPolicy.Automatic(maxWritesBeforeRotation = 0L)
         }
         assertFailsWith<IllegalArgumentException> {
-            KeyRotationPolicy.Automatic(maxRetainedKeys = 0)
+            KeyRotationPolicy.Automatic(maxRetainedKeys = 1)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            UserAuthConfig(authValidityDurationSeconds = 0)
         }
         assertFailsWith<IllegalArgumentException> {
             UserAuthConfig(authValidityDurationSeconds = -1)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            SecurityConfig(
+                storeName = "invalid_combo",
+                recoveryPolicy = KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK,
+                userAuthConfig = UserAuthConfig(authValidityDurationSeconds = 30),
+            )
         }
 
         val okPolicy = KeyRotationPolicy.Automatic(
             maxKeyAge = 1.days,
             maxWritesBeforeRotation = 1L,
-            maxRetainedKeys = 1,
+            maxRetainedKeys = 2,
         )
-        assertEquals(1, okPolicy.maxRetainedKeys)
+        assertEquals(2, okPolicy.maxRetainedKeys)
+
+        val c1 = SecurityConfig(storeName = "eq_test", associatedDataProvider = { byteArrayOf(1) })
+        val c2 = SecurityConfig(storeName = "eq_test", associatedDataProvider = { byteArrayOf(2) })
+        assertEquals(c1, c2)
+        assertEquals(c1.hashCode(), c2.hashCode())
     }
 }

@@ -18,6 +18,7 @@ import java.security.ProviderException
 import java.security.UnrecoverableKeyException
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
+import javax.crypto.IllegalBlockSizeException
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
@@ -52,7 +53,7 @@ internal class AndroidKeyStoreAead(
     internal val alias: String = buildAlias(context.packageName, config.storeName)
 
     @Volatile
-    private var detectedSecurityLevel: SecurityLevel? = null
+    private var detectedSecurityLevel: SecurityLevel = SecurityLevel.UNKNOWN
 
     fun ensureKeyAndGetSecurityLevel(): SecurityLevel = synchronized(keyStoreLock) {
         try {
@@ -121,7 +122,7 @@ internal class AndroidKeyStoreAead(
             if (ks.containsAlias(alias)) {
                 ks.deleteEntry(alias)
             }
-            detectedSecurityLevel = null
+            detectedSecurityLevel = SecurityLevel.UNKNOWN
         } catch (t: Throwable) {
             throw classifyAndroidKeyStoreError("delete", t)
         }
@@ -147,10 +148,14 @@ internal class AndroidKeyStoreAead(
         if (tryStrongBox) {
             try {
                 return generateKey(useStrongBox = true).also {
-                    detectedSecurityLevel = SecurityLevel.STRONGBOX
+                    detectedSecurityLevel = detectSecurityLevelLocked(it)
                 }
             } catch (e: Throwable) {
-                if (isStrongBoxUnavailable(e)) {
+                if (isUserAuthError(e)) {
+                    throw classifyAndroidKeyStoreError("generate_strongbox", e)
+                }
+                // Many OEMs throw generic ProviderException or KeyStoreException when StrongBox fails.
+                if (isStrongBoxFallbackCandidate(e)) {
                     config.eventListener?.onEvent(
                         SecurityEvent.StrongBoxFallbackToTee(
                             storeName = config.storeName,
@@ -194,9 +199,7 @@ internal class AndroidKeyStoreAead(
                 specBuilder.setUserAuthenticationParameters(auth.authValidityDurationSeconds, authTypes)
             } else {
                 @Suppress("DEPRECATION")
-                specBuilder.setUserAuthenticationValidityDurationSeconds(
-                    auth.authValidityDurationSeconds.coerceAtLeast(1)
-                )
+                specBuilder.setUserAuthenticationValidityDurationSeconds(auth.authValidityDurationSeconds)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 specBuilder.setInvalidatedByBiometricEnrollment(auth.invalidateOnBiometricEnrollment)
@@ -208,7 +211,9 @@ internal class AndroidKeyStoreAead(
     }
 
     private fun detectSecurityLevelLocked(key: SecretKey): SecurityLevel {
-        detectedSecurityLevel?.let { return it }
+        if (detectedSecurityLevel != SecurityLevel.UNKNOWN) {
+            return detectedSecurityLevel
+        }
         val resolved = try {
             val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
             val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
@@ -216,29 +221,27 @@ internal class AndroidKeyStoreAead(
                 when (info.securityLevel) {
                     KeyProperties.SECURITY_LEVEL_STRONGBOX -> SecurityLevel.STRONGBOX
                     KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> SecurityLevel.HARDWARE_TEE
-                    else -> SecurityLevel.SOFTWARE_FALLBACK
+                    KeyProperties.SECURITY_LEVEL_SOFTWARE -> SecurityLevel.SOFTWARE_FALLBACK
+                    else -> SecurityLevel.UNKNOWN
                 }
             } else {
                 @Suppress("DEPRECATION")
                 if (info.isInsideSecureHardware) SecurityLevel.HARDWARE_TEE else SecurityLevel.SOFTWARE_FALLBACK
             }
         } catch (_: Throwable) {
-            SecurityLevel.HARDWARE_TEE
+            SecurityLevel.UNKNOWN
         }
         detectedSecurityLevel = resolved
         return resolved
     }
 
-    private fun isStrongBoxUnavailable(t: Throwable): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && t is StrongBoxUnavailableException) {
-            return true
-        }
+    private fun isStrongBoxFallbackCandidate(t: Throwable): Boolean {
         var cur: Throwable? = t
         while (cur != null) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && cur is StrongBoxUnavailableException) {
                 return true
             }
-            if (cur is ProviderException && cur.message?.contains("StrongBox", ignoreCase = true) == true) {
+            if (cur is ProviderException || cur is KeyStoreException) {
                 return true
             }
             cur = cur.cause
@@ -246,9 +249,19 @@ internal class AndroidKeyStoreAead(
         return false
     }
 
+    private fun isUserAuthError(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            if (cur is UserNotAuthenticatedException) return true
+            if (cur.message?.contains("user not authenticated", ignoreCase = true) == true) return true
+            cur = cur.cause
+        }
+        return false
+    }
+
     private fun classifyAndroidKeyStoreError(op: String, t: Throwable): SecurityStorageException {
         if (t is SecurityStorageException) return t
-        if (t is UserNotAuthenticatedException || t.cause is UserNotAuthenticatedException) {
+        if (isUserAuthError(t)) {
             return UserAuthenticationRequiredException(
                 "User authentication required to $op key for '${config.storeName}'",
                 t,
@@ -265,6 +278,12 @@ internal class AndroidKeyStoreAead(
         if (t is AEADBadTagException || t.cause is AEADBadTagException) {
             return StoreTamperedOrCorruptedException(
                 "AndroidKeyStore AEAD tag mismatch during $op for '${config.storeName}'",
+                t,
+            )
+        }
+        if (t is IllegalBlockSizeException && config.userAuthConfig != null) {
+            return UserAuthenticationRequiredException(
+                "User authentication required or key locked during $op for '${config.storeName}'",
                 t,
             )
         }

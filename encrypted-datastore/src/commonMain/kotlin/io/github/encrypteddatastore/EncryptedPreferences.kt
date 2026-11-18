@@ -202,6 +202,8 @@ public class MutableEncryptedPreferences internal constructor(
 
     public fun contains(key: PreferenceKey<*>): Boolean = mutableEntries.containsKey(key.name)
 
+    internal fun containsName(name: String): Boolean = mutableEntries.containsKey(name)
+
     public fun clear() {
         mutableEntries.clear()
     }
@@ -222,7 +224,10 @@ public class EncryptedPreferences internal constructor(
         .distinctUntilChanged()
 
     public fun <T> observe(key: PreferenceKey<T>): Flow<T?> =
-        data.map { snapshot -> snapshot[key] }.distinctUntilChanged()
+        store.data
+            .map { state -> state.entries[key.name] }
+            .distinctUntilChanged()
+            .map { entry -> entry?.let { key.decode(it, json) } }
 
     public suspend fun <T> get(key: PreferenceKey<T>): T? = data.first()[key]
 

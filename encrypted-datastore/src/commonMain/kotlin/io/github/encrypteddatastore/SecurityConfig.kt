@@ -36,16 +36,16 @@ public enum class KeystoreRecoveryPolicy {
 
     /**
      * If the master key or encrypted store is permanently corrupted (not merely locked by user auth),
-     * atomically wipe the corrupted keyset and store, generate fresh keys, reset to default value,
-     * and invoke [SecurityConfig.onRecovery].
+     * atomically wipe the corrupted keyset and reset the store to its default value,
+     * invoking [SecurityConfig.onRecovery].
      */
     CLEAR_AND_REGENERATE,
 
     /**
-     * Explicit opt-in fallback for devices with broken OEM Keystore implementations.
-     * If hardware/TEE Keystore permanently fails keyset wrapping/unwrapping, derives a local
-     * software KEK using HKDF/PBKDF2 over an installation-unique CSPRNG secret stored outside backups.
-     * Diagnostics will report [SecurityLevel.SOFTWARE_FALLBACK].
+     * Explicit opt-in fallback for devices where `AndroidKeyStore` itself is broken or unavailable.
+     * Cannot be combined with [UserAuthConfig]. Derives a local software KEK via HKDF-SHA256
+     * over an installation-unique CSPRNG secret stored outside backups, and reports
+     * [SecurityLevel.SOFTWARE_FALLBACK] in [EncryptedDataStore.diagnostics].
      */
     EXPLICIT_SOFTWARE_FALLBACK,
 }
@@ -61,7 +61,7 @@ public sealed interface KeyRotationPolicy {
 
     /**
      * Automatically rotates the primary key when either [maxKeyAge] or [maxWritesBeforeRotation]
-     * is reached, retaining up to [maxRetainedKeys] historical key epochs for crash-safe reads.
+     * is reached, retaining up to [maxRetainedKeys] historical key epochs (>= 2) for crash-safe reads.
      */
     public data class Automatic(
         public val maxKeyAge: Duration = 90.days,
@@ -71,7 +71,9 @@ public sealed interface KeyRotationPolicy {
         init {
             require(maxKeyAge.isPositive()) { "maxKeyAge must be positive" }
             require(maxWritesBeforeRotation > 0L) { "maxWritesBeforeRotation must be positive" }
-            require(maxRetainedKeys >= 1) { "maxRetainedKeys must be at least 1" }
+            require(maxRetainedKeys >= 2) {
+                "maxRetainedKeys must be at least 2 to prevent data loss if a crash occurs mid-rotation"
+            }
         }
     }
 }
@@ -82,14 +84,18 @@ public sealed interface KeyRotationPolicy {
 public enum class SecurityLevel {
     STRONGBOX,
     HARDWARE_TEE,
-    SECURE_ENCLAVE,
     KEYCHAIN,
-    JVM_KEYSTORE,
+    PASSPHRASE_PBKDF2,
+    LOCAL_FILE_KEK,
     SOFTWARE_FALLBACK,
+    UNKNOWN,
 }
 
 /**
  * Optional biometric / device credential lock configuration for hardware-backed keys.
+ *
+ * Requires a positive [authValidityDurationSeconds] because per-operation `0`-second keys
+ * require explicit `BiometricPrompt.CryptoObject` handling not exposed by DataStore streams.
  */
 public data class UserAuthConfig(
     public val authValidityDurationSeconds: Int = 30,
@@ -97,8 +103,8 @@ public data class UserAuthConfig(
     public val invalidateOnBiometricEnrollment: Boolean = true,
 ) {
     init {
-        require(authValidityDurationSeconds >= 0) {
-            "authValidityDurationSeconds must be >= 0"
+        require(authValidityDurationSeconds > 0) {
+            "authValidityDurationSeconds must be > 0"
         }
     }
 }
@@ -177,7 +183,7 @@ public data class SecurityDiagnostics(
 /**
  * Security configuration for an [EncryptedDataStore] or [EncryptedPreferences] instance.
  */
-public data class SecurityConfig(
+public class SecurityConfig(
     public val storeName: String,
     public val algorithm: CipherAlgorithm = CipherAlgorithm.AES256_GCM,
     public val keyRotationPolicy: KeyRotationPolicy = KeyRotationPolicy.Automatic(),
@@ -198,5 +204,34 @@ public data class SecurityConfig(
         require(!storeName.contains("..")) {
             "storeName must not contain '..'"
         }
+        require(!(recoveryPolicy == KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK && userAuthConfig != null)) {
+            "EXPLICIT_SOFTWARE_FALLBACK cannot be combined with userAuthConfig: software fallback keys cannot enforce biometric/device authentication."
+        }
     }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is SecurityConfig) return false
+        return storeName == other.storeName &&
+            algorithm == other.algorithm &&
+            keyRotationPolicy == other.keyRotationPolicy &&
+            recoveryPolicy == other.recoveryPolicy &&
+            preferStrongBox == other.preferStrongBox &&
+            userAuthConfig == other.userAuthConfig &&
+            iosAccessibility == other.iosAccessibility
+    }
+
+    override fun hashCode(): Int {
+        var result = storeName.hashCode()
+        result = 31 * result + algorithm.hashCode()
+        result = 31 * result + keyRotationPolicy.hashCode()
+        result = 31 * result + recoveryPolicy.hashCode()
+        result = 31 * result + preferStrongBox.hashCode()
+        result = 31 * result + (userAuthConfig?.hashCode() ?: 0)
+        result = 31 * result + iosAccessibility.hashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "SecurityConfig(storeName=$storeName, algorithm=$algorithm, recoveryPolicy=$recoveryPolicy, preferStrongBox=$preferStrongBox)"
 }

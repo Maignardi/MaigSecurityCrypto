@@ -1,8 +1,6 @@
 package io.github.encrypteddatastore
 
 import com.google.crypto.tink.Aead
-import com.google.crypto.tink.InsecureSecretKeyAccess
-import com.google.crypto.tink.KeyStatus
 import com.google.crypto.tink.KeyTemplates
 import com.google.crypto.tink.KeysetHandle
 import com.google.crypto.tink.RegistryConfiguration
@@ -16,8 +14,14 @@ import kotlinx.serialization.json.Json
 import okio.Buffer
 import okio.FileSystem
 import okio.Path
+import java.io.FileOutputStream
+import java.nio.channels.FileChannel
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.GeneralSecurityException
-import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
@@ -56,12 +60,17 @@ internal class JvmTinkKeyManager(
     private val kekSaltOrSecretPath: Path = storeDir / "${config.storeName}.kek"
     private val metadataPath: Path = storeDir / "${config.storeName}.meta"
 
+    private var cachedKekAead: Aead? = null
     private var cachedHandle: KeysetHandle? = null
     private var cachedAead: Aead? = null
     private var cachedMetadata: KeyRotationMetadata? = null
 
-    override val securityLevel: SecurityLevel =
-        if (context.masterPassphraseProvider != null) SecurityLevel.JVM_KEYSTORE else SecurityLevel.SOFTWARE_FALLBACK
+    private val securityLevel: SecurityLevel =
+        if (context.masterPassphraseProvider != null) {
+            SecurityLevel.PASSPHRASE_PBKDF2
+        } else {
+            SecurityLevel.LOCAL_FILE_KEK
+        }
 
     override suspend fun currentEpoch(): Long = mutex.withLock {
         ensureInitializedLocked()
@@ -78,25 +87,31 @@ internal class JvmTinkKeyManager(
         cachedMetadata!!.writesSinceRotation
     }
 
-    override suspend fun encrypt(plaintext: ByteArray, associatedData: ByteArray): EncryptedPayload =
-        mutex.withLock {
-            ensureInitializedLocked()
-            val aead = cachedAead!!
-            val meta = cachedMetadata!!
-            val ciphertext = try {
-                aead.encrypt(plaintext, associatedData)
-            } catch (e: GeneralSecurityException) {
-                throw EncryptionException("AEAD encryption failed for '${config.storeName}'", e)
-            }
-            val updatedMeta = meta.copy(writesSinceRotation = meta.writesSinceRotation + 1L)
-            persistMetadataLocked(aead, updatedMeta)
-            cachedMetadata = updatedMeta
-            EncryptedPayload(
-                keyEpoch = meta.epoch,
-                algorithm = config.algorithm,
-                ciphertext = ciphertext,
-            )
+    override suspend fun encryptEnvelope(
+        plaintext: ByteArray,
+        headerBuilder: (CipherAlgorithm, Long) -> ByteArray,
+        aadBuilder: (ByteArray) -> ByteArray,
+    ): EncryptedEnvelopeResult = mutex.withLock {
+        ensureInitializedLocked()
+        val aead = cachedAead!!
+        val meta = cachedMetadata!!
+        val header = headerBuilder(config.algorithm, meta.epoch)
+        val aad = aadBuilder(header)
+        val ciphertext = try {
+            aead.encrypt(plaintext, aad)
+        } catch (e: GeneralSecurityException) {
+            throw EncryptionException("AEAD encryption failed for '${config.storeName}'", e)
         }
+        val updatedMeta = meta.copy(writesSinceRotation = meta.writesSinceRotation + 1L)
+        if (config.keyRotationPolicy is KeyRotationPolicy.Automatic) {
+            persistMetadataLocked(aead, updatedMeta)
+        }
+        cachedMetadata = updatedMeta
+        EncryptedEnvelopeResult(
+            keyEpoch = meta.epoch,
+            envelopeBytes = EncryptedEnvelopeCodec.encode(header, ciphertext),
+        )
+    }
 
     override suspend fun decrypt(
         ciphertext: ByteArray,
@@ -129,7 +144,7 @@ internal class JvmTinkKeyManager(
                 else -> null
             }
             if (trigger != null) {
-                return@withLock rotateKeyLocked(policy.maxRetainedKeys, trigger)
+                return@withLock rotateKeyLocked(policy.maxRetainedKeys.coerceAtLeast(2), trigger)
             }
         }
         meta.epoch
@@ -137,7 +152,7 @@ internal class JvmTinkKeyManager(
 
     override suspend fun rotateKey(maxRetainedKeys: Int, trigger: String): Long = mutex.withLock {
         ensureInitializedLocked()
-        rotateKeyLocked(maxRetainedKeys, trigger)
+        rotateKeyLocked(maxRetainedKeys.coerceAtLeast(2), trigger)
     }
 
     override suspend fun pruneHistoricalKeys() {
@@ -165,6 +180,7 @@ internal class JvmTinkKeyManager(
         context.fileSystem.delete(keysetPath, mustExist = false)
         context.fileSystem.delete(metadataPath, mustExist = false)
         context.fileSystem.delete(kekSaltOrSecretPath, mustExist = false)
+        cachedKekAead = null
         cachedHandle = null
         cachedAead = null
         cachedMetadata = null
@@ -260,7 +276,6 @@ internal class JvmTinkKeyManager(
             .makePrimary()
         builder.addEntry(newEntry)
 
-        // Trim oldest entries beyond maxRetainedKeys while preserving the newly added primary.
         var provisional = builder.build()
         if (provisional.size() > maxRetainedKeys) {
             val primaryId = provisional.primary.id
@@ -342,8 +357,10 @@ internal class JvmTinkKeyManager(
     }
 
     private fun obtainKekAeadLocked(createIfMissing: Boolean): Aead {
+        cachedKekAead?.let { return it }
+
         val passphraseProvider = context.masterPassphraseProvider
-        if (passphraseProvider != null) {
+        val kekAead = if (passphraseProvider != null) {
             val salt = if (context.fileSystem.exists(kekSaltOrSecretPath)) {
                 readBytes(kekSaltOrSecretPath)
             } else {
@@ -355,10 +372,14 @@ internal class JvmTinkKeyManager(
                     atomicWrite(kekSaltOrSecretPath, it)
                 }
             }
-            val passphrase = passphraseProvider.invoke()
-            val derivedKey = derivePbkdf2Key(passphrase, salt)
-            passphrase.fill('\u0000')
-            return try {
+            // Copy caller-supplied CharArray so we never mutate a reusable buffer held by the caller.
+            val passphraseCopy = passphraseProvider.invoke().copyOf()
+            val derivedKey = try {
+                derivePbkdf2Key(passphraseCopy, salt)
+            } finally {
+                passphraseCopy.fill('\u0000')
+            }
+            try {
                 AesGcmJce(derivedKey)
             } finally {
                 derivedKey.wipe()
@@ -375,12 +396,15 @@ internal class JvmTinkKeyManager(
                     atomicWrite(kekSaltOrSecretPath, it)
                 }
             }
-            return try {
+            try {
                 AesGcmJce(secret)
             } finally {
                 secret.wipe()
             }
         }
+
+        cachedKekAead = kekAead
+        return kekAead
     }
 
     private fun derivePbkdf2Key(passphrase: CharArray, salt: ByteArray): ByteArray {
@@ -395,12 +419,49 @@ internal class JvmTinkKeyManager(
 
     private fun atomicWrite(target: Path, bytes: ByteArray) {
         val tmp = target.parent!! / "${target.name}.tmp"
-        context.fileSystem.write(tmp) {
-            write(bytes)
+        if (context.fileSystem !== FileSystem.SYSTEM) {
+            context.fileSystem.write(tmp) { write(bytes) }
+            context.fileSystem.atomicMove(tmp, target)
+            return
         }
-        enforceRestrictiveFilePermissions(context.fileSystem, tmp)
-        context.fileSystem.atomicMove(tmp, target)
+
+        val tmpFile = tmp.toFile()
+        val targetFile = target.toFile()
+        val tmpNio = tmpFile.toPath()
+        val targetNio = targetFile.toPath()
+
+        if (tmpFile.exists()) {
+            tmpFile.delete()
+        }
+        // Create temp file with restrictive 0600 permissions BEFORE writing any sensitive bytes.
+        try {
+            val perms = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
+            Files.createFile(tmpNio, perms)
+        } catch (_: UnsupportedOperationException) {
+            tmpFile.createNewFile()
+            enforceRestrictiveFilePermissions(context.fileSystem, tmp)
+        }
+
+        FileOutputStream(tmpFile).use { fos ->
+            fos.write(bytes)
+            fos.flush()
+            fos.fd.sync()
+        }
+
+        try {
+            Files.move(tmpNio, targetNio, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(tmpNio, targetNio, StandardCopyOption.REPLACE_EXISTING)
+        }
         enforceRestrictiveFilePermissions(context.fileSystem, target)
+        fsyncParentDirectory(targetFile.parentFile?.toPath())
+    }
+
+    private fun fsyncParentDirectory(dirPath: java.nio.file.Path?) {
+        if (dirPath == null) return
+        runCatching {
+            FileChannel.open(dirPath, StandardOpenOption.READ).use { it.force(true) }
+        }
     }
 
     private fun readBytes(path: Path): ByteArray {

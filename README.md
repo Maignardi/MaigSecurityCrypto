@@ -3,7 +3,7 @@
 A modern, security-first **Kotlin Multiplatform (Android, JVM, iOS)** replacement for Android's deprecated `androidx.security:security-crypto` (`EncryptedSharedPreferences` and `EncryptedFile`), built on **Jetpack DataStore (Okio)**, **Google Tink**, **AndroidKeyStore / StrongBox**, and **iOS Keychain**.
 
 - **Minimum Android SDK:** API 23 (Android 6.0+) — StrongBox hardware support on API 28+
-- **Targets:** `android`, `jvm`, `iosArm64`, `iosSimulatorArm64`, `iosX64`
+- **Targets:** `android`, `jvm`, `iosArm64`, `iosSimulatorArm64`
 - **License:** Apache 2.0
 
 ---
@@ -68,26 +68,17 @@ dependencyResolutionManagement {
 **Android app/library (`app/build.gradle.kts`):**
 ```kotlin
 dependencies {
-    implementation("com.github.Maignardi:encrypted-datastore:0.1.0")
+    implementation("com.github.Maignardi:encrypted-datastore:0.1.1")
 }
 ```
 
-**Kotlin Multiplatform (`shared/build.gradle.kts`):**
-```kotlin
-kotlin {
-    sourceSets {
-        commonMain.dependencies {
-            implementation("com.github.Maignardi:encrypted-datastore:0.1.0")
-        }
-    }
-}
-```
+> **Note for Kotlin Multiplatform (`ios` + `android` + `jvm`):** JitPack builds on Linux and publishes Android and JVM artifacts only. If your KMP `commonMain` targets iOS as well, use **GitHub Packages** (Option C below) or depend on `encrypted-datastore` inside `androidMain` / `jvmMain` when using JitPack.
 
 ### Option B: Version Catalog (`libs.versions.toml`)
 
 ```toml
 [versions]
-encryptedDatastore = "0.1.0"
+encryptedDatastore = "0.1.1"
 
 [libraries]
 encrypted-datastore = { module = "com.github.Maignardi:encrypted-datastore", version.ref = "encryptedDatastore" }
@@ -117,7 +108,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.maignardi:encrypted-datastore:0.1.0")
+    implementation("io.github.maignardi:encrypted-datastore:0.1.1")
 }
 ```
 
@@ -258,6 +249,8 @@ sessionStore.updateData { current ->
 val currentSession: SessionState = sessionStore.get()
 ```
 
+> **Warning on `associatedDataProvider`:** `associatedDataProvider` is evaluated on **every** read and write. Ensure the value it returns is deterministic across app restarts (for example, an already-resolved `userId` or `tenantId`). If the returned bytes differ on a later read, decryption fails with `StoreTamperedOrCorruptedException` — and under `CLEAR_AND_REGENERATE`, that mismatch wipes and resets the store. For per-user isolation across logins, prefer a scoped `storeName` such as `"session_$userId"`.
+
 ---
 
 ### 4. Migrating from Legacy `SharedPreferences` / `EncryptedSharedPreferences`
@@ -289,7 +282,7 @@ Some Android OEMs suffer from `AndroidKeyStore` bugs (keys invalidated after OS 
 | --- | --- | --- |
 | `KeystoreRecoveryPolicy.STRICT` *(Default)* | Fails closed by throwing `SecurityStorageException` (`KeystoreUnavailableException` / `StoreTamperedOrCorruptedException`). | High-security secrets, banking/payment tokens where silent resets are unacceptable. |
 | `KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE` | Atomically wipes the corrupted keyset and store file, generates fresh keys, resets to default value, and calls `onRecovery`. | Session caches or tokens where the user can cleanly re-authenticate after OS Keystore corruption. |
-| `KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK` | Explicit opt-in for broken OEM Keystores: derives an app-scoped software KEK via HKDF-SHA256 over an installation-unique CSPRNG secret in `noBackupFilesDir`, and reports `SecurityLevel.SOFTWARE_FALLBACK` in `diagnostics()`. | Non-critical preferences or apps targeting devices with known broken hardware Keystores. |
+| `KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK` | Explicit opt-in for broken OEM Keystores (cannot be combined with `UserAuthConfig`): derives an app-scoped software KEK via HKDF-SHA256 over an installation-unique CSPRNG secret in `noBackupFilesDir`, and reports `SecurityLevel.SOFTWARE_FALLBACK` in `diagnostics()`. | Non-critical preferences or apps targeting devices with known broken hardware Keystores. |
 
 ```kotlin
 val config = SecurityConfig(
@@ -321,8 +314,8 @@ val newEpoch: Long = authPrefs.rotateKeys()
 
 // 2. Inspect active security posture (safe for debug panels/telemetry; zero secrets exposed)
 val diag: SecurityDiagnostics = authPrefs.diagnostics()
-// diag.securityLevel -> STRONGBOX / HARDWARE_TEE / KEYCHAIN / JVM_KEYSTORE / SOFTWARE_FALLBACK
-// diag.hardwareBacked -> true / false
+// diag.securityLevel -> STRONGBOX / HARDWARE_TEE / KEYCHAIN / PASSPHRASE_PBKDF2 / LOCAL_FILE_KEK / SOFTWARE_FALLBACK / UNKNOWN
+// diag.hardwareBacked -> true on Android StrongBox/TEE; false on software fallback, JVM, or iOS Keychain (DEK used in app memory)
 // diag.currentKeyEpoch -> 2
 // diag.writesSinceRotation -> 0
 
@@ -351,7 +344,10 @@ val biometricVault = EncryptedDataStoreFactory.createPreferences(
 )
 ```
 
-> **Important:** When the device is locked or the authentication window has expired, operations throw `UserAuthenticationRequiredException`. This transient lock state **never** triggers corruption recovery or store wiping — prompt `BiometricPrompt` and retry.
+> **Important:**
+> - `authValidityDurationSeconds` must be `> 0` (per-operation `0`-second keys require `BiometricPrompt.CryptoObject`, which DataStore streams do not expose).
+> - When `userAuthConfig` is enabled on Android, the DEK keyset is **not** cached in RAM across operations so the Keystore authentication timeout is genuinely enforced. On iOS, Keychain items use `SecAccessControl` (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).
+> - When the device is locked or the authentication window has expired, operations throw `UserAuthenticationRequiredException`. This transient lock state **never** triggers corruption recovery or store wiping — prompt `BiometricPrompt` and retry.
 
 ---
 
@@ -360,7 +356,7 @@ val biometricVault = EncryptedDataStoreFactory.createPreferences(
 Instantiate `PlatformStorageContext` per platform and share your store factory in `commonMain`:
 
 ```kotlin
-// commonMain
+// commonMain (use CipherAlgorithm.AES256_GCM when targeting iOS; XCHACHA20_POLY1305 is Android/JVM only)
 class VaultRepository(context: PlatformStorageContext) {
     val prefs = EncryptedDataStoreFactory.createPreferences(
         context = context,
@@ -393,11 +389,11 @@ VaultRepository(
 1. Push changes to `Maignardi/encrypted-datastore`.
 2. Create and push a version tag:
    ```bash
-   git tag 0.1.0
-   git push origin 0.1.0
+   git tag 0.1.1
+   git push origin 0.1.1
    ```
-3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.1.0")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
-4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.1.0`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
+3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.1.1")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
+4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.1.1`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
 
 ---
 

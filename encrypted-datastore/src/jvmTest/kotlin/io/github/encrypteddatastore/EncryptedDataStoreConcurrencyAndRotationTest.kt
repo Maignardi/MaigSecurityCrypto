@@ -3,7 +3,9 @@ package io.github.encrypteddatastore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.Serializable
 import okio.FileSystem
@@ -174,6 +176,34 @@ class EncryptedDataStoreConcurrencyAndRotationTest {
         prefs.edit { it.clear() }
         assertFalse(prefs.contains(bytesKey))
 
+        prefs.close()
+    }
+
+    @Test
+    fun `observe on ByteArray key only emits when that key changes`() = runTest {
+        val prefs = EncryptedDataStoreFactory.createPreferences(
+            context = testContext(),
+            config = SecurityConfig(storeName = "prefs_bytearray_observe"),
+        )
+        val bytesKey = PreferenceKeys.byteArray("seed")
+        val otherKey = PreferenceKeys.string("other")
+
+        val observed = mutableListOf<ByteArray?>()
+        val job = launch {
+            prefs.observe(bytesKey).take(3).toList(observed)
+        }
+
+        prefs.edit { it[bytesKey] = byteArrayOf(1, 2, 3) }
+        // Mutating an unrelated key must NOT re-emit bytesKey
+        prefs.edit { it[otherKey] = "unrelated_change" }
+        prefs.edit { it[bytesKey] = byteArrayOf(4, 5, 6) }
+        job.join()
+
+        assertEquals(3, observed.size)
+        assertNull(observed[0])
+        assertContentEquals(byteArrayOf(1, 2, 3), observed[1])
+        assertContentEquals(byteArrayOf(4, 5, 6), observed[2])
+        assertEquals(SecurityLevel.LOCAL_FILE_KEK, prefs.diagnostics().securityLevel)
         prefs.close()
     }
 

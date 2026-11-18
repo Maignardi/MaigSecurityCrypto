@@ -11,18 +11,12 @@ import java.io.File
 
 public actual class PlatformStorageContext(
     context: Context,
-    internal val useNoBackupDir: Boolean = true,
 ) {
     public val applicationContext: Context = context.applicationContext
 }
 
 internal fun resolveAndroidStoreDirectory(context: PlatformStorageContext): File {
-    val baseDir = if (context.useNoBackupDir) {
-        context.applicationContext.noBackupFilesDir
-    } else {
-        context.applicationContext.filesDir
-    }
-    val storeDir = File(baseDir, "encrypted_datastore")
+    val storeDir = File(context.applicationContext.noBackupFilesDir, "encrypted_datastore")
     if (!storeDir.exists()) {
         storeDir.mkdirs()
     }

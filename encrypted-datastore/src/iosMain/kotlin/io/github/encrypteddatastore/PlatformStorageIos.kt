@@ -2,7 +2,6 @@
 
 package io.github.encrypteddatastore
 
-import kotlinx.cinterop.toKString
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
@@ -52,7 +51,8 @@ private fun resolveDefaultAppSupportDir(): String {
         inDomains = NSUserDomainMask,
     )
     val url = urls.firstOrNull() as? NSURL
-    return url?.path ?: "/tmp"
+    return url?.path
+        ?: throw KeyManagementException("Unable to resolve NSApplicationSupportDirectory on iOS")
 }
 
 private fun excludeFromBackup(path: String) {

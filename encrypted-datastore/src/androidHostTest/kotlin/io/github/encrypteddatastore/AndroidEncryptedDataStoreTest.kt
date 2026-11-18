@@ -128,6 +128,45 @@ class AndroidEncryptedDataStoreTest {
     }
 
     @Test
+    fun `SharedPreferences migration is idempotent when clearSourceOnSuccess is false`() = runTest {
+        val ctx = context()
+        val legacyPrefs = ctx.getSharedPreferences("idempotent_legacy", Context.MODE_PRIVATE)
+        legacyPrefs.edit()
+            .putString("token", "old_token")
+            .putInt("version", 1)
+            .commit()
+
+        val encryptedPrefs = EncryptedDataStoreFactory.createPreferences(
+            context = PlatformStorageContext(ctx),
+            config = SecurityConfig(
+                storeName = "idempotent_target",
+                recoveryPolicy = KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK,
+            ),
+        )
+
+        val first = encryptedPrefs.migrateFromSharedPreferences(
+            source = legacyPrefs,
+            clearSourceOnSuccess = false,
+        )
+        assertEquals(2, first.migratedKeys)
+        assertFalse(first.sourceCleared)
+
+        // App updates token in EncryptedPreferences
+        val tokenKey = PreferenceKeys.string("token")
+        encryptedPrefs.edit { it[tokenKey] = "newer_token" }
+
+        // Running migration again must NOT overwrite newer_token with old_token
+        val second = encryptedPrefs.migrateFromSharedPreferences(
+            source = legacyPrefs,
+            clearSourceOnSuccess = false,
+        )
+        assertEquals(0, second.migratedKeys)
+        assertEquals(setOf("token", "version"), second.skippedExistingKeys)
+        assertEquals("newer_token", encryptedPrefs.get(tokenKey))
+        encryptedPrefs.close()
+    }
+
+    @Test
     fun `software fallback supports key rotation tamper recovery and clearAndReset on Android`() = runTest {
         val ctx = context()
         val storageCtx = PlatformStorageContext(ctx)

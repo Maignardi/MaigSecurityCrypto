@@ -1,6 +1,5 @@
 package io.github.encrypteddatastore
 
-import androidx.datastore.core.CorruptionException
 import androidx.datastore.core.DataStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancelAndJoin
@@ -67,7 +66,7 @@ public class EncryptedDataStore<T> internal constructor(
         return operationMutex.withLock {
             val maxRetained = when (val policy = config.keyRotationPolicy) {
                 KeyRotationPolicy.Manual -> 2
-                is KeyRotationPolicy.Automatic -> policy.maxRetainedKeys
+                is KeyRotationPolicy.Automatic -> policy.maxRetainedKeys.coerceAtLeast(2)
             }
             val newEpoch = keyManager.rotateKey(maxRetainedKeys = maxRetained, trigger = "manual")
             internalStore.updateData { box ->
@@ -84,23 +83,11 @@ public class EncryptedDataStore<T> internal constructor(
      */
     public suspend fun clearAndReset() {
         operationMutex.withLock {
-            try {
-                val newEpoch = keyManager.rotateKey(maxRetainedKeys = 2, trigger = "clear_and_reset")
-                internalStore.updateData {
-                    EncryptedBox(value = defaultValueProvider(), keyEpoch = newEpoch)
-                }
-                keyManager.pruneHistoricalKeys()
-            } catch (e: Exception) {
-                if (e is SecurityStorageException || e is CorruptionException) {
-                    fileSystem.delete(filePath, mustExist = false)
-                    val freshEpoch = keyManager.resetAndRegenerate(reason = "clear_and_reset_recovery")
-                    internalStore.updateData {
-                        EncryptedBox(value = defaultValueProvider(), keyEpoch = freshEpoch)
-                    }
-                } else {
-                    throw e
-                }
+            val newEpoch = keyManager.rotateKey(maxRetainedKeys = 2, trigger = "clear_and_reset")
+            internalStore.updateData {
+                EncryptedBox(value = defaultValueProvider(), keyEpoch = newEpoch)
             }
+            keyManager.pruneHistoricalKeys()
             enforceRestrictiveFilePermissions(fileSystem, filePath)
         }
     }

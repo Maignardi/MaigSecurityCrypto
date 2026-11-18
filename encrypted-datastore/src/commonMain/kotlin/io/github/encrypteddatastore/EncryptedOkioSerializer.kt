@@ -73,7 +73,13 @@ internal class EncryptedOkioSerializer<T>(
         } catch (decryptError: DecryptionException) {
             handleReadFailure(decryptError)
         } catch (e: Exception) {
-            if (e is SecurityStorageException) throw e
+            if (e is SecurityStorageException) {
+                if (config.recoveryPolicy == KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE) {
+                    handleReadFailure(e)
+                } else {
+                    throw e
+                }
+            }
             handleReadFailure(
                 StoreTamperedOrCorruptedException(
                     "Failed to decode encrypted store '${config.storeName}'",
@@ -86,26 +92,21 @@ internal class EncryptedOkioSerializer<T>(
     override suspend fun writeTo(t: EncryptedBox<T>, sink: BufferedSink) {
         val jsonBytes = json.encodeToString(kSerializer, t.value).encodeToByteArray()
         try {
-            val epoch = keyManager.currentEpoch()
-            val header = EncryptedEnvelopeCodec.buildHeader(config.algorithm, epoch)
-            val aad = EncryptedEnvelopeCodec.buildAssociatedData(
-                header = header,
-                storeName = config.storeName,
-                userAad = config.associatedDataProvider?.invoke(),
+            val userAad = config.associatedDataProvider?.invoke()
+            val result = keyManager.encryptEnvelope(
+                plaintext = jsonBytes,
+                headerBuilder = { alg, epoch ->
+                    EncryptedEnvelopeCodec.buildHeader(alg, epoch)
+                },
+                aadBuilder = { header ->
+                    EncryptedEnvelopeCodec.buildAssociatedData(
+                        header = header,
+                        storeName = config.storeName,
+                        userAad = userAad,
+                    )
+                },
             )
-            val encrypted = keyManager.encrypt(jsonBytes, aad)
-            val finalHeader = if (encrypted.keyEpoch == epoch && encrypted.algorithm == config.algorithm) {
-                header
-            } else {
-                // Ensure envelope header always matches exact keyEpoch/algorithm used.
-                EncryptedEnvelopeCodec.buildHeader(encrypted.algorithm, encrypted.keyEpoch)
-            }
-            // Note: encrypt() uses the AAD computed from the active header; assert consistency.
-            check(finalHeader.contentEquals(header)) {
-                "Envelope header diverged during write encryption"
-            }
-            val envelopeBytes = EncryptedEnvelopeCodec.encode(header, encrypted.ciphertext)
-            sink.write(envelopeBytes)
+            sink.write(result.envelopeBytes)
             pendingRecoveryEpoch = null
         } finally {
             jsonBytes.wipe()

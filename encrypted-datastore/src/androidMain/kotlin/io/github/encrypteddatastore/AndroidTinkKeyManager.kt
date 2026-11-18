@@ -15,6 +15,12 @@ import kotlinx.serialization.json.Json
 import okio.Buffer
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.channels.FileChannel
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.GeneralSecurityException
 import java.security.SecureRandom
 import kotlin.time.DurationUnit
@@ -30,6 +36,9 @@ internal data class AndroidKeyRotationMetadata(
  * Android KeyManager combining Google Tink DEK keysets with an [AndroidKeyStoreAead] KEK
  * stored in `noBackupFilesDir` with atomic writes, 0600 permissions, key rotation, and explicit
  * OEM Keystore failure policies.
+ *
+ * Note: When [SecurityConfig.userAuthConfig] is configured, the DEK keyset is NOT cached in RAM
+ * across operations so AndroidKeyStore's authentication validity timeout is enforced on each access.
  */
 internal class AndroidTinkKeyManager(
     private val context: PlatformStorageContext,
@@ -53,54 +62,60 @@ internal class AndroidTinkKeyManager(
     private val storeDir: File = resolveAndroidStoreDirectory(context)
     private val keysetFile = File(storeDir, "${config.storeName}.keyset")
     private val metadataFile = File(storeDir, "${config.storeName}.meta")
-    private val storeDataFile = File(storeDir, "${config.storeName}.edst")
     private val softwareSecretFile = File(storeDir, "${config.storeName}.swkek")
 
     private val hardwareKekAead = AndroidKeyStoreAead(context.applicationContext, config)
+    private val shouldCacheDekInMemory: Boolean = config.userAuthConfig == null
 
     private var activeKekAead: Aead? = null
     private var cachedHandle: KeysetHandle? = null
     private var cachedAead: Aead? = null
     private var cachedMetadata: AndroidKeyRotationMetadata? = null
-    private var currentSecurityLevel: SecurityLevel = SecurityLevel.HARDWARE_TEE
+    private var currentSecurityLevel: SecurityLevel = SecurityLevel.UNKNOWN
 
-    override val securityLevel: SecurityLevel
-        get() = currentSecurityLevel
+    private data class UnlockedState(
+        val kek: Aead,
+        val handle: KeysetHandle,
+        val aead: Aead,
+        val meta: AndroidKeyRotationMetadata,
+        val level: SecurityLevel,
+    )
 
     override suspend fun currentEpoch(): Long = mutex.withLock {
-        ensureInitializedLocked()
-        cachedMetadata!!.epoch
+        obtainUnlockedStateLocked().meta.epoch
     }
 
     override suspend fun keyCreatedAtEpochMs(): Long = mutex.withLock {
-        ensureInitializedLocked()
-        cachedMetadata!!.createdAtEpochMs
+        obtainUnlockedStateLocked().meta.createdAtEpochMs
     }
 
     override suspend fun writesSinceRotation(): Long = mutex.withLock {
-        ensureInitializedLocked()
-        cachedMetadata!!.writesSinceRotation
+        obtainUnlockedStateLocked().meta.writesSinceRotation
     }
 
-    override suspend fun encrypt(plaintext: ByteArray, associatedData: ByteArray): EncryptedPayload =
-        mutex.withLock {
-            ensureInitializedLocked()
-            val aead = cachedAead!!
-            val meta = cachedMetadata!!
-            val ciphertext = try {
-                aead.encrypt(plaintext, associatedData)
-            } catch (e: GeneralSecurityException) {
-                throw EncryptionException("AEAD encryption failed for '${config.storeName}'", e)
-            }
-            val updatedMeta = meta.copy(writesSinceRotation = meta.writesSinceRotation + 1L)
-            persistMetadataLocked(aead, updatedMeta)
-            cachedMetadata = updatedMeta
-            EncryptedPayload(
-                keyEpoch = meta.epoch,
-                algorithm = config.algorithm,
-                ciphertext = ciphertext,
-            )
+    override suspend fun encryptEnvelope(
+        plaintext: ByteArray,
+        headerBuilder: (CipherAlgorithm, Long) -> ByteArray,
+        aadBuilder: (ByteArray) -> ByteArray,
+    ): EncryptedEnvelopeResult = mutex.withLock {
+        val state = obtainUnlockedStateLocked()
+        val header = headerBuilder(config.algorithm, state.meta.epoch)
+        val aad = aadBuilder(header)
+        val ciphertext = try {
+            state.aead.encrypt(plaintext, aad)
+        } catch (e: GeneralSecurityException) {
+            throw EncryptionException("AEAD encryption failed for '${config.storeName}'", e)
         }
+        val updatedMeta = state.meta.copy(writesSinceRotation = state.meta.writesSinceRotation + 1L)
+        if (config.keyRotationPolicy is KeyRotationPolicy.Automatic) {
+            persistMetadataLocked(state.aead, updatedMeta)
+        }
+        cachedMetadata = updatedMeta
+        EncryptedEnvelopeResult(
+            keyEpoch = state.meta.epoch,
+            envelopeBytes = EncryptedEnvelopeCodec.encode(header, ciphertext),
+        )
+    }
 
     override suspend fun decrypt(
         ciphertext: ByteArray,
@@ -108,10 +123,9 @@ internal class AndroidTinkKeyManager(
         keyEpoch: Long,
         associatedData: ByteArray,
     ): ByteArray = mutex.withLock {
-        ensureInitializedLocked()
-        val aead = cachedAead!!
+        val state = obtainUnlockedStateLocked()
         try {
-            aead.decrypt(ciphertext, associatedData)
+            state.aead.decrypt(ciphertext, associatedData)
         } catch (e: GeneralSecurityException) {
             throw StoreTamperedOrCorruptedException(
                 "AEAD authentication failed for '${config.storeName}' (epoch=$keyEpoch, alg=$algorithm)",
@@ -121,44 +135,44 @@ internal class AndroidTinkKeyManager(
     }
 
     override suspend fun rotateIfPolicyRequires(policy: KeyRotationPolicy): Long = mutex.withLock {
-        ensureInitializedLocked()
-        val meta = cachedMetadata!!
+        val state = obtainUnlockedStateLocked()
         if (policy is KeyRotationPolicy.Automatic) {
             val nowMs = System.currentTimeMillis()
-            val ageMs = (nowMs - meta.createdAtEpochMs).coerceAtLeast(0L)
+            val ageMs = (nowMs - state.meta.createdAtEpochMs).coerceAtLeast(0L)
             val maxAgeMs = policy.maxKeyAge.toLong(DurationUnit.MILLISECONDS)
             val trigger = when {
-                meta.writesSinceRotation >= policy.maxWritesBeforeRotation -> "write_limit"
+                state.meta.writesSinceRotation >= policy.maxWritesBeforeRotation -> "write_limit"
                 ageMs >= maxAgeMs -> "max_age"
                 else -> null
             }
             if (trigger != null) {
-                return@withLock rotateKeyLocked(policy.maxRetainedKeys, trigger)
+                return@withLock rotateKeyLocked(state, policy.maxRetainedKeys.coerceAtLeast(2), trigger)
             }
         }
-        meta.epoch
+        state.meta.epoch
     }
 
     override suspend fun rotateKey(maxRetainedKeys: Int, trigger: String): Long = mutex.withLock {
-        ensureInitializedLocked()
-        rotateKeyLocked(maxRetainedKeys, trigger)
+        val state = obtainUnlockedStateLocked()
+        rotateKeyLocked(state, maxRetainedKeys.coerceAtLeast(2), trigger)
     }
 
     override suspend fun pruneHistoricalKeys() {
         mutex.withLock {
-            ensureInitializedLocked()
-            val currentHandle = cachedHandle!!
-            val primaryId = currentHandle.primary.id
-            val builder = KeysetHandle.newBuilder(currentHandle)
-            for (i in currentHandle.size() - 1 downTo 0) {
-                if (currentHandle.getAt(i).id != primaryId) {
+            val state = obtainUnlockedStateLocked()
+            val primaryId = state.handle.primary.id
+            val builder = KeysetHandle.newBuilder(state.handle)
+            for (i in state.handle.size() - 1 downTo 0) {
+                if (state.handle.getAt(i).id != primaryId) {
                     builder.deleteAt(i)
                 }
             }
             val prunedHandle = builder.build()
-            persistKeysetLocked(activeKekAead!!, prunedHandle)
-            cachedHandle = prunedHandle
-            cachedAead = prunedHandle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
+            persistKeysetLocked(state.kek, prunedHandle)
+            if (shouldCacheDekInMemory) {
+                cachedHandle = prunedHandle
+                cachedAead = prunedHandle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
+            }
         }
     }
 
@@ -167,134 +181,126 @@ internal class AndroidTinkKeyManager(
         val previousEpoch = cachedMetadata?.epoch ?: 0L
         wipeAllKeyFilesLocked()
         val nextEpoch = (previousEpoch + 1L).coerceAtLeast(1L)
-        initializeFreshWithPolicyLocked(initialEpoch = nextEpoch)
-        nextEpoch
+        val created = initializeFreshWithPolicyLocked(initialEpoch = nextEpoch)
+        created.meta.epoch
     }
 
     override suspend fun diagnostics(): SecurityDiagnostics = mutex.withLock {
-        ensureInitializedLocked()
-        val meta = cachedMetadata!!
+        val state = obtainUnlockedStateLocked()
         SecurityDiagnostics(
             storeName = config.storeName,
             algorithm = config.algorithm,
-            securityLevel = currentSecurityLevel,
-            currentKeyEpoch = meta.epoch,
-            keyCreatedAtEpochMs = meta.createdAtEpochMs,
-            writesSinceRotation = meta.writesSinceRotation,
-            hardwareBacked = currentSecurityLevel == SecurityLevel.STRONGBOX ||
-                currentSecurityLevel == SecurityLevel.HARDWARE_TEE,
+            securityLevel = state.level,
+            currentKeyEpoch = state.meta.epoch,
+            keyCreatedAtEpochMs = state.meta.createdAtEpochMs,
+            writesSinceRotation = state.meta.writesSinceRotation,
+            hardwareBacked = state.level == SecurityLevel.STRONGBOX ||
+                state.level == SecurityLevel.HARDWARE_TEE,
         )
     }
 
-    private suspend fun ensureInitializedLocked() {
+    private fun obtainUnlockedStateLocked(): UnlockedState {
         check(tinkRegistered)
-        if (cachedHandle != null && cachedAead != null && cachedMetadata != null) return
+        if (shouldCacheDekInMemory &&
+            activeKekAead != null &&
+            cachedHandle != null &&
+            cachedAead != null &&
+            cachedMetadata != null
+        ) {
+            return UnlockedState(
+                kek = activeKekAead!!,
+                handle = cachedHandle!!,
+                aead = cachedAead!!,
+                meta = cachedMetadata!!,
+                level = currentSecurityLevel,
+            )
+        }
         enforceRestrictiveDirPermissions(storeDir)
 
-        if (keysetFile.exists()) {
+        return if (keysetFile.exists()) {
             loadExistingWithPolicyLocked()
         } else {
             initializeFreshWithPolicyLocked(initialEpoch = 1L)
         }
     }
 
-    private suspend fun initializeFreshWithPolicyLocked(initialEpoch: Long) {
+    private fun initializeFreshWithPolicyLocked(initialEpoch: Long): UnlockedState {
         try {
             val level = hardwareKekAead.ensureKeyAndGetSecurityLevel()
-            val kek = hardwareKekAead
-            createFreshKeysetLocked(kek, level, initialEpoch)
+            return createFreshKeysetLocked(hardwareKekAead, level, initialEpoch)
         } catch (auth: UserAuthenticationRequiredException) {
             throw auth
-        } catch (e: SecurityStorageException) {
-            if (config.recoveryPolicy == KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK) {
-                activateSoftwareFallbackAndCreateLocked(
-                    reason = e.message ?: "android_keystore_unavailable",
+        } catch (unavailable: KeystoreUnavailableException) {
+            if (config.recoveryPolicy == KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK &&
+                config.userAuthConfig == null
+            ) {
+                return activateSoftwareFallbackAndCreateLocked(
+                    reason = unavailable.message ?: "android_keystore_unavailable",
                     initialEpoch = initialEpoch,
                 )
-            } else {
-                throw e
             }
+            throw unavailable
         }
     }
 
-    private suspend fun loadExistingWithPolicyLocked() {
-        // If explicit software fallback was previously activated for this store, use software KEK directly.
-        if (softwareSecretFile.exists() && config.recoveryPolicy == KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK) {
-            val swKek = obtainSoftwareFallbackKekLocked(createIfMissing = false)
-            try {
-                loadKeysetWithKekLocked(swKek, SecurityLevel.SOFTWARE_FALLBACK)
-                return
-            } catch (e: SecurityStorageException) {
-                // Corrupted software keyset: wipe and regenerate cleanly under explicit fallback.
-                wipeAllKeyFilesLocked()
-                activateSoftwareFallbackAndCreateLocked(
-                    reason = e.message ?: "corrupted_software_keyset",
-                    initialEpoch = 1L,
+    private fun loadExistingWithPolicyLocked(): UnlockedState {
+        // Software fallback is only allowed if explicitly enabled AND userAuthConfig is null.
+        if (softwareSecretFile.exists()) {
+            if (config.recoveryPolicy != KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK ||
+                config.userAuthConfig != null
+            ) {
+                throw KeyManagementException(
+                    "Store '${config.storeName}' was initialized with software fallback, which is disallowed by current policy '${config.recoveryPolicy}'."
                 )
-                return
             }
+            val swKek = obtainSoftwareFallbackKekLocked(createIfMissing = false)
+            return loadKeysetWithKekLocked(swKek, SecurityLevel.SOFTWARE_FALLBACK)
         }
 
-        try {
+        return try {
             val level = hardwareKekAead.ensureKeyAndGetSecurityLevel()
             loadKeysetWithKekLocked(hardwareKekAead, level)
         } catch (auth: UserAuthenticationRequiredException) {
-            // Never wipe or downgrade when user simply needs to unlock / authenticate.
             throw auth
-        } catch (e: SecurityStorageException) {
-            when (config.recoveryPolicy) {
-                KeystoreRecoveryPolicy.STRICT -> throw e
-                KeystoreRecoveryPolicy.CLEAR_AND_REGENERATE -> {
-                    val reason = e.message ?: e::class.simpleName ?: "keystore_failure"
-                    wipeAllKeyFilesLocked()
-                    storeDataFile.delete()
-                    val level = hardwareKekAead.ensureKeyAndGetSecurityLevel()
-                    createFreshKeysetLocked(hardwareKekAead, level, initialEpoch = 1L)
-                    config.eventListener?.onEvent(
-                        SecurityEvent.CorruptionRecovered(
-                            storeName = config.storeName,
-                            reason = reason,
-                            newEpoch = 1L,
-                        )
-                    )
-                    config.onRecovery?.invoke(
-                        RecoveryEvent(
-                            storeName = config.storeName,
-                            reason = reason,
-                            newEpoch = 1L,
-                        )
-                    )
-                }
-
-                KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK -> {
-                    val reason = e.message ?: e::class.simpleName ?: "oem_keystore_broken"
-                    wipeAllKeyFilesLocked()
-                    storeDataFile.delete()
-                    activateSoftwareFallbackAndCreateLocked(reason = reason, initialEpoch = 1L)
-                    config.onRecovery?.invoke(
-                        RecoveryEvent(
-                            storeName = config.storeName,
-                            reason = reason,
-                            newEpoch = 1L,
-                        )
-                    )
-                }
+        } catch (unavailable: KeystoreUnavailableException) {
+            // Note: Do NOT delete DataStore's .edst file here or wipe silently.
+            // If EXPLICIT_SOFTWARE_FALLBACK is opted in without userAuthConfig AND the hardware
+            // Keystore itself failed (no valid hardware keyset unwrap possible), allow fallback only
+            // when AndroidKeyStore cannot operate; otherwise fail closed or let CLEAR_AND_REGENERATE
+            // handle it once via EncryptedOkioSerializer.
+            if (config.recoveryPolicy == KeystoreRecoveryPolicy.EXPLICIT_SOFTWARE_FALLBACK &&
+                config.userAuthConfig == null
+            ) {
+                throw KeystoreUnavailableException(
+                    "Hardware Keystore failed for existing store '${config.storeName}'. " +
+                        "Use CLEAR_AND_REGENERATE to reset or resolve Keystore lock.",
+                    unavailable,
+                )
             }
+            throw unavailable
         }
     }
 
-    private fun activateSoftwareFallbackAndCreateLocked(reason: String, initialEpoch: Long) {
+    private fun activateSoftwareFallbackAndCreateLocked(reason: String, initialEpoch: Long): UnlockedState {
+        check(config.userAuthConfig == null) {
+            "Software fallback cannot be activated when userAuthConfig is enabled"
+        }
         val swKek = obtainSoftwareFallbackKekLocked(createIfMissing = true)
-        createFreshKeysetLocked(swKek, SecurityLevel.SOFTWARE_FALLBACK, initialEpoch)
+        val state = createFreshKeysetLocked(swKek, SecurityLevel.SOFTWARE_FALLBACK, initialEpoch)
         config.eventListener?.onEvent(
             SecurityEvent.SoftwareFallbackActivated(
                 storeName = config.storeName,
                 reason = reason,
             )
         )
+        return state
     }
 
-    private fun createFreshKeysetLocked(kek: Aead, level: SecurityLevel, initialEpoch: Long) {
+    private fun createFreshKeysetLocked(
+        kek: Aead,
+        level: SecurityLevel,
+        initialEpoch: Long,
+    ): UnlockedState {
         val handle = KeysetHandle.generateNew(KeyTemplates.get(tinkParameterName(config.algorithm)))
         val aead = handle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
         val meta = AndroidKeyRotationMetadata(
@@ -304,11 +310,13 @@ internal class AndroidTinkKeyManager(
         )
         persistKeysetLocked(kek, handle)
         persistMetadataLocked(aead, meta)
-        activeKekAead = kek
-        cachedHandle = handle
-        cachedAead = aead
         cachedMetadata = meta
         currentSecurityLevel = level
+        if (shouldCacheDekInMemory) {
+            activeKekAead = kek
+            cachedHandle = handle
+            cachedAead = aead
+        }
         config.eventListener?.onEvent(
             SecurityEvent.KeyInitialized(
                 storeName = config.storeName,
@@ -316,9 +324,10 @@ internal class AndroidTinkKeyManager(
                 epoch = initialEpoch,
             )
         )
+        return UnlockedState(kek, handle, aead, meta, level)
     }
 
-    private fun loadKeysetWithKekLocked(kek: Aead, level: SecurityLevel) {
+    private fun loadKeysetWithKekLocked(kek: Aead, level: SecurityLevel): UnlockedState {
         val encryptedBytes = keysetFile.readBytes()
         val handle = try {
             TinkProtoKeysetFormat.parseEncryptedKeyset(
@@ -328,7 +337,10 @@ internal class AndroidTinkKeyManager(
             )
         } catch (t: Throwable) {
             if (t is SecurityStorageException) throw t
-            throw KeyManagementException("Failed to unwrap Tink keyset for '${config.storeName}'", t)
+            throw StoreTamperedOrCorruptedException(
+                "Failed to unwrap Tink keyset for '${config.storeName}'",
+                t,
+            )
         }
         val aead = handle.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
         val meta = if (metadataFile.exists()) {
@@ -340,17 +352,18 @@ internal class AndroidTinkKeyManager(
                 writesSinceRotation = 0L,
             ).also { persistMetadataLocked(aead, it) }
         }
-        activeKekAead = kek
-        cachedHandle = handle
-        cachedAead = aead
         cachedMetadata = meta
         currentSecurityLevel = level
+        if (shouldCacheDekInMemory) {
+            activeKekAead = kek
+            cachedHandle = handle
+            cachedAead = aead
+        }
+        return UnlockedState(kek, handle, aead, meta, level)
     }
 
-    private fun rotateKeyLocked(maxRetainedKeys: Int, trigger: String): Long {
-        val oldHandle = cachedHandle!!
-        val oldMeta = cachedMetadata!!
-        val builder = KeysetHandle.newBuilder(oldHandle)
+    private fun rotateKeyLocked(state: UnlockedState, maxRetainedKeys: Int, trigger: String): Long {
+        val builder = KeysetHandle.newBuilder(state.handle)
         val newEntry = KeysetHandle.generateEntryFromParametersName(tinkParameterName(config.algorithm))
             .withRandomId()
             .makePrimary()
@@ -373,21 +386,23 @@ internal class AndroidTinkKeyManager(
         }
 
         val newAead = provisional.getPrimitive(RegistryConfiguration.get(), Aead::class.java)
-        val newEpoch = oldMeta.epoch + 1L
+        val newEpoch = state.meta.epoch + 1L
         val newMeta = AndroidKeyRotationMetadata(
             epoch = newEpoch,
             createdAtEpochMs = System.currentTimeMillis(),
             writesSinceRotation = 0L,
         )
-        persistKeysetLocked(activeKekAead!!, provisional)
+        persistKeysetLocked(state.kek, provisional)
         persistMetadataLocked(newAead, newMeta)
-        cachedHandle = provisional
-        cachedAead = newAead
         cachedMetadata = newMeta
+        if (shouldCacheDekInMemory) {
+            cachedHandle = provisional
+            cachedAead = newAead
+        }
         config.eventListener?.onEvent(
             SecurityEvent.KeyRotated(
                 storeName = config.storeName,
-                oldEpoch = oldMeta.epoch,
+                oldEpoch = state.meta.epoch,
                 newEpoch = newEpoch,
                 trigger = trigger,
             )
@@ -395,7 +410,7 @@ internal class AndroidTinkKeyManager(
         return newEpoch
     }
 
-    private suspend fun wipeAllKeyFilesLocked() {
+    private fun wipeAllKeyFilesLocked() {
         runCatching { hardwareKekAead.deleteMasterKey() }
         keysetFile.delete()
         metadataFile.delete()
@@ -404,6 +419,7 @@ internal class AndroidTinkKeyManager(
         cachedHandle = null
         cachedAead = null
         cachedMetadata = null
+        currentSecurityLevel = SecurityLevel.UNKNOWN
     }
 
     private fun obtainSoftwareFallbackKekLocked(createIfMissing: Boolean): Aead {
@@ -470,17 +486,34 @@ internal class AndroidTinkKeyManager(
 
     private fun atomicWriteFile(target: File, bytes: ByteArray) {
         val tmp = File(target.parentFile, "${target.name}.tmp")
+        val tmpPath = tmp.toPath()
+        val targetPath = target.toPath()
+        if (tmp.exists()) {
+            tmp.delete()
+        }
+        try {
+            val perms = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
+            Files.createFile(tmpPath, perms)
+        } catch (_: UnsupportedOperationException) {
+            tmp.createNewFile()
+            enforceFilePermissions(tmp)
+        }
         FileOutputStream(tmp).use { fos ->
             fos.write(bytes)
             fos.flush()
             fos.fd.sync()
         }
-        enforceFilePermissions(tmp)
-        if (!tmp.renameTo(target)) {
-            if (target.exists()) target.delete()
-            check(tmp.renameTo(target)) { "Failed to atomically move ${tmp.name} to ${target.name}" }
+        try {
+            Files.move(tmpPath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(tmpPath, targetPath, StandardCopyOption.REPLACE_EXISTING)
         }
         enforceFilePermissions(target)
+        runCatching {
+            target.parentFile?.toPath()?.let { dirPath ->
+                FileChannel.open(dirPath, StandardOpenOption.READ).use { it.force(true) }
+            }
+        }
     }
 
     private fun enforceFilePermissions(file: File) {

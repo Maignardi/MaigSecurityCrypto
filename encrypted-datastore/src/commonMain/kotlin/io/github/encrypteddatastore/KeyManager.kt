@@ -4,10 +4,9 @@ import kotlinx.coroutines.CoroutineScope
 import okio.FileSystem
 import okio.Path
 
-internal data class EncryptedPayload(
+internal data class EncryptedEnvelopeResult(
     val keyEpoch: Long,
-    val algorithm: CipherAlgorithm,
-    val ciphertext: ByteArray,
+    val envelopeBytes: ByteArray,
 )
 
 /**
@@ -16,15 +15,22 @@ internal data class EncryptedPayload(
  * in exceptions or logs.
  */
 internal interface KeyManager {
-    val securityLevel: SecurityLevel
-
     suspend fun currentEpoch(): Long
 
     suspend fun keyCreatedAtEpochMs(): Long
 
     suspend fun writesSinceRotation(): Long
 
-    suspend fun encrypt(plaintext: ByteArray, associatedData: ByteArray): EncryptedPayload
+    /**
+     * Atomically builds the envelope header from the active algorithm and epoch,
+     * computes associated data via [aadBuilder], encrypts [plaintext], and returns
+     * the complete serialized envelope bytes.
+     */
+    suspend fun encryptEnvelope(
+        plaintext: ByteArray,
+        headerBuilder: (CipherAlgorithm, Long) -> ByteArray,
+        aadBuilder: (ByteArray) -> ByteArray,
+    ): EncryptedEnvelopeResult
 
     suspend fun decrypt(
         ciphertext: ByteArray,
@@ -41,7 +47,7 @@ internal interface KeyManager {
 
     /**
      * Unconditionally promotes a new primary key, increments the key epoch, and trims retained
-     * historical keys according to [maxRetainedKeys].
+     * historical keys according to [maxRetainedKeys] (minimum 2).
      */
     suspend fun rotateKey(maxRetainedKeys: Int, trigger: String = "manual"): Long
 

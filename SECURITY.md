@@ -7,14 +7,16 @@
 - **Android (`androidMain`)**:
   - **KEK:** 256-bit AES-GCM key generated inside `AndroidKeyStore` (`setRandomizedEncryptionRequired(true)`).
     - Requests StrongBox (`SECURITY_LEVEL_STRONGBOX`) on API 28+ when `preferStrongBox = true` and `PackageManager.FEATURE_STRONGBOX_KEYSTORE` is present.
-    - Gracefully falls back to TEE hardware Keystore (`SECURITY_LEVEL_TRUSTED_ENVIRONMENT`) if StrongBox throws `StrongBoxUnavailableException` or `ProviderException`, emitting `SecurityEvent.StrongBoxFallbackToTee`.
+    - Gracefully falls back to TEE hardware Keystore (`SECURITY_LEVEL_TRUSTED_ENVIRONMENT`) if StrongBox generation fails (`StrongBoxUnavailableException`, `ProviderException`, or `KeyStoreException`), emitting `SecurityEvent.StrongBoxFallbackToTee`.
     - All `AndroidKeyStore` calls are serialized via an internal synchronization lock to prevent OEM concurrency crashes.
-  - **DEK:** Google Tink `KeysetHandle` (`AES256_GCM` or `XCHACHA20_POLY1305`) wrapped by the KEK using `TinkProtoKeysetFormat.serializeEncryptedKeyset` with domain-separated AAD (`packageName:storeName`), persisted atomically (`write -> flush -> fsync -> rename`) inside `noBackupFilesDir/encrypted_datastore/<storeName>.keyset` with `0600` permissions.
+    - When `UserAuthConfig` is enabled, the DEK keyset is unwrapped on each access rather than cached in RAM so AndroidKeyStore's `authValidityDurationSeconds` timeout is enforced.
+  - **DEK:** Google Tink `KeysetHandle` (`AES256_GCM` or `XCHACHA20_POLY1305`) wrapped by the KEK using `TinkProtoKeysetFormat.serializeEncryptedKeyset` with domain-separated AAD (`packageName:storeName`), persisted atomically (`create 0600 temp file -> write -> flush -> fsync -> atomic move -> fsync parent dir`) inside `noBackupFilesDir/encrypted_datastore/<storeName>.keyset`.
 - **iOS (`iosMain`)**:
-  - **DEK Keyset:** 256-bit CSPRNG (`SecRandomCopyBytes`) AES-GCM keys stored in the iOS Keychain (`kSecClassGenericPassword`) with `ThisDeviceOnly` accessibility (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` by default).
+  - **Algorithm:** `CipherAlgorithm.AES256_GCM` only (passing `XCHACHA20_POLY1305` fails fast on initialization).
+  - **DEK Keyset:** 256-bit CSPRNG (`SecRandomCopyBytes`) AES-GCM keys stored in the iOS Keychain (`kSecClassGenericPassword`) with `ThisDeviceOnly` accessibility (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` by default, or `SecAccessControl` when `UserAuthConfig` is provided). Because the DEK is loaded into app memory for Apple native AES-GCM (`cryptography-provider-apple`), `diagnostics().hardwareBacked` honestly reports `false` (`SecurityLevel.KEYCHAIN`).
   - DataStore files are written inside `NSApplicationSupportDirectory/encrypted_datastore/` with `NSURLIsExcludedFromBackupKey = true` and `0700`/`0600` permissions.
 - **JVM (`jvmMain`)**:
-  - Uses Google Tink `KeysetHandle` wrapped with either a PBKDF2-HMAC-SHA256 key (`310,000` iterations, 32-byte CSPRNG salt) when `masterPassphraseProvider` is configured, or an isolated local AES-256-GCM KEK file (`0600`).
+  - Uses Google Tink `KeysetHandle` wrapped with either a PBKDF2-HMAC-SHA256 key (`310,000` iterations, 32-byte CSPRNG salt, `SecurityLevel.PASSPHRASE_PBKDF2`) when `masterPassphraseProvider` is configured, or an isolated local AES-256-GCM KEK file (`0600`, `SecurityLevel.LOCAL_FILE_KEK`). Caller `CharArray` buffers returned by `masterPassphraseProvider` are copied before clearing so reusable caller arrays are never mutated.
 
 ---
 
@@ -70,4 +72,4 @@ Recovery behavior is strictly governed by `KeystoreRecoveryPolicy`:
 - **Automatic Rotation:** Triggered by key age (`maxKeyAge`) or write count (`maxWritesBeforeRotation`) stored in AEAD-authenticated metadata (`<storeName>.meta`) to prevent timestamp/counter rollback.
 - **Atomic Re-encryption:** `rotateKeys()` increments the key epoch and forces DataStore to atomically write and `fsync` a fresh encrypted envelope under the new primary key while pruning keys beyond `maxRetainedKeys`.
 - **Secure Wipe (`clearAndReset`):** Overwrites persisted state with `defaultValue` under a new key epoch and destroys all historical keys so prior ciphertext snapshots become undecryptable.
-- **Transient Buffer Wiping:** Serialized plaintext JSON `ByteArray` buffers are zeroed via `ByteArray.wipe()` in `finally` blocks immediately after encryption/decryption.
+- **Transient Buffer Wiping:** Serialized plaintext JSON `ByteArray` buffers (and temporary key/passphrase copies created by this library) are zeroed via `ByteArray.wipe()` in `finally` blocks immediately after encryption/decryption. Underlying cryptographic providers (Google Tink / JCA / Apple CryptoKit) and Swift/Kotlin immutable strings (`Base64` inside iOS Keychain JSON) manage their own memory lifecycles within JVM/Native runtime constraints.

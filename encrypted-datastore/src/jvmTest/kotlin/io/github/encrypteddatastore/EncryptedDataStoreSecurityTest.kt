@@ -375,16 +375,30 @@ class EncryptedDataStoreSecurityTest {
     }
 
     @Test
-    fun `passphrase derived KEK rejects wrong passphrase`() = runTest {
+    fun `passphrase derived KEK rejects wrong passphrase and preserves caller CharArray`() = runTest {
+        val reusablePassphrase = "correct-horse-battery-staple".toCharArray()
         val store = EncryptedDataStoreFactory.create(
-            context = testContext { "correct-horse-battery-staple".toCharArray() },
+            context = testContext { reusablePassphrase },
             config = SecurityConfig(storeName = "pbkdf2_test"),
             serializer = AuthSession.serializer(),
             defaultValue = { AuthSession() },
         )
         store.updateData { AuthSession(accessToken = "locked_secret") }
-        assertEquals(SecurityLevel.JVM_KEYSTORE, store.diagnostics().securityLevel)
+        assertEquals(SecurityLevel.PASSPHRASE_PBKDF2, store.diagnostics().securityLevel)
+        // Ensure caller's buffer was NOT zeroed and works across rotation and reopen
+        assertEquals("correct-horse-battery-staple", reusablePassphrase.concatToString())
+        store.rotateKeys()
+        assertEquals("correct-horse-battery-staple", reusablePassphrase.concatToString())
         store.close()
+
+        val reopenedOk = EncryptedDataStoreFactory.create(
+            context = testContext { reusablePassphrase },
+            config = SecurityConfig(storeName = "pbkdf2_test"),
+            serializer = AuthSession.serializer(),
+            defaultValue = { AuthSession() },
+        )
+        assertEquals("locked_secret", reopenedOk.get().accessToken)
+        reopenedOk.close()
 
         val wrongPassStore = EncryptedDataStoreFactory.create(
             context = testContext { "wrong-passphrase".toCharArray() },
