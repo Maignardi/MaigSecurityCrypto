@@ -48,7 +48,7 @@ A modern, security-first **Kotlin Multiplatform (Android, JVM, iOS)** replacemen
 
 ## Installation (Direct from GitHub)
 
-Consumers can add **MaigSecurityCrypto** via Gradle without cloning this repository locally (Maven artifact coordinates remain `encrypted-datastore`).
+Consumers can add **MaigSecurityCrypto** via Gradle without cloning this repository locally.
 
 ### Option A: JitPack (Android & JVM)
 
@@ -70,20 +70,20 @@ dependencyResolutionManagement {
 **Android app/library (`app/build.gradle.kts`):**
 ```kotlin
 dependencies {
-    implementation("com.github.Maignardi:encrypted-datastore:0.3.0")
+    implementation("com.github.Maignardi:MaigSecurityCrypto:0.3.1")
 }
 ```
 
-> **Note for Kotlin Multiplatform (`ios` + `android` + `jvm`):** JitPack builds on Linux and publishes Android and JVM artifacts only. If your KMP `commonMain` targets iOS as well, use **GitHub Packages** (Option C below) or depend on `encrypted-datastore` inside `androidMain` / `jvmMain` when using JitPack.
+> **Note for Kotlin Multiplatform (`ios` + `android` + `jvm`):** JitPack builds on Linux and publishes Android and JVM artifacts only. If your KMP `commonMain` targets iOS as well, use **GitHub Packages** (Option C below) or depend on `com.github.Maignardi:MaigSecurityCrypto:0.3.1` inside `androidMain` / `jvmMain` when using JitPack.
 
 ### Option B: Version Catalog (`libs.versions.toml`)
 
 ```toml
 [versions]
-maigSecurityCrypto = "0.3.0"
+maigSecurityCrypto = "0.3.1"
 
 [libraries]
-maig-security-crypto = { module = "com.github.Maignardi:encrypted-datastore", version.ref = "maigSecurityCrypto" }
+maig-security-crypto = { module = "com.github.Maignardi:MaigSecurityCrypto", version.ref = "maigSecurityCrypto" }
 ```
 
 ```kotlin
@@ -101,7 +101,7 @@ repositories {
     google()
     mavenCentral()
     maven {
-        url = uri("https://maven.pkg.github.com/Maignardi/encrypted-datastore")
+        url = uri("https://maven.pkg.github.com/Maignardi/MaigSecurityCrypto")
         credentials {
             username = providers.gradleProperty("gpr.user").orNull ?: System.getenv("GITHUB_ACTOR")
             password = providers.gradleProperty("gpr.key").orNull ?: System.getenv("GITHUB_TOKEN")
@@ -110,7 +110,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.maignardi:encrypted-datastore:0.3.0")
+    implementation("io.github.maignardi:MaigSecurityCrypto:0.3.1")
 }
 ```
 
@@ -408,8 +408,8 @@ VaultRepository(
 
 ## Upgrading from `0.2.x` (`EncryptedDataStore` -> `MaigSecurityCrypto`)
 
-In `0.3.0`, the library was branded as **MaigSecurityCrypto**:
-- Gradle/Maven coordinates (`com.github.Maignardi:encrypted-datastore` and `io.github.maignardi:encrypted-datastore`) stay unchanged.
+In `0.3.x`, the library was renamed to **MaigSecurityCrypto**:
+- Starting in `0.3.1`, update the repository/Gradle coordinates to `com.github.Maignardi:MaigSecurityCrypto:0.3.1` (JitPack) or `io.github.maignardi:MaigSecurityCrypto:0.3.1` (GitHub Packages).
 - Existing `.edst` encrypted files, `AndroidKeyStore` aliases, and iOS Keychain items stay **100% compatible** — users upgrading in-place keep all stored data.
 - Update imports from `io.github.encrypteddatastore.*` to `io.github.maigsecuritycrypto.*` and rename public symbols (`EncryptedDataStoreFactory` -> `MaigSecurityCrypto`, `EncryptedPreferences` -> `MaigEncryptedPreferences`, `EncryptedDataStore` -> `MaigEncryptedDataStore`, `SecurityConfig` -> `MaigSecurityConfig`, `PlatformStorageContext` -> `MaigStorageContext`, etc.).
 
@@ -417,14 +417,14 @@ In `0.3.0`, the library was branded as **MaigSecurityCrypto**:
 
 ## Publishing a Release from GitHub
 
-1. Push changes to `Maignardi/encrypted-datastore`.
+1. Push changes to `Maignardi/MaigSecurityCrypto`.
 2. Create and push a version tag:
    ```bash
-   git tag 0.3.0
-   git push origin 0.3.0
+   git tag 0.3.1
+   git push origin 0.3.1
    ```
-3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:encrypted-datastore:0.3.0")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
-4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.3.0`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
+3. **JitPack:** Anyone can immediately add `implementation("com.github.Maignardi:MaigSecurityCrypto:0.3.1")` — JitPack reads [`jitpack.yml`](jitpack.yml), builds with JDK 21 + Android SDK 35, and publishes the Android, JVM, and KMP artifacts automatically.
+4. **GitHub Packages:** Push a `v*` tag (e.g. `v0.3.1`) to trigger [`.github/workflows/publish.yml`](.github/workflows/publish.yml), publishing all targets including iOS.
 
 ---
 
@@ -433,7 +433,7 @@ In `0.3.0`, the library was branded as **MaigSecurityCrypto**:
 - **Why do I get `IllegalStateException: There are multiple DataStores active for the same file`?**
   Jetpack DataStore requires a single active instance per file path per process. Create each `MaigEncryptedDataStore` / `MaigEncryptedPreferences` once as a singleton (Hilt `@Singleton`, Koin `single`, or `object` / `Application` property). In unit tests that reopen the same store path, call `suspend fun close()` before creating a new instance.
 - **Do I need extra ProGuard / R8 rules?**
-  No. [`consumer-rules.pro`](encrypted-datastore/consumer-rules.pro) is embedded inside the published AAR (`proguard.txt`) and applied automatically in release builds.
+  No. [`consumer-rules.pro`](MaigSecurityCrypto/consumer-rules.pro) is embedded inside the published AAR (`proguard.txt`) and applied automatically in release builds.
 - **Are files excluded from Android Auto Backup?**
   Yes. By default, encrypted `.edst` payloads, `.keyset` files, and `.meta` files are stored in `context.noBackupFilesDir` with `0700`/`0600` POSIX permissions.
 
@@ -445,7 +445,7 @@ In `0.3.0`, the library was branded as **MaigSecurityCrypto**:
 - Run the full verification suite:
 
 ```bash
-./gradlew :encrypted-datastore:jvmTest :encrypted-datastore:testAndroidHostTest :encrypted-datastore:verifyAndroidMinSdk23Compatibility :sample-android:testDebugUnitTest
+./gradlew :MaigSecurityCrypto:jvmTest :MaigSecurityCrypto:testAndroidHostTest :MaigSecurityCrypto:verifyAndroidMinSdk23Compatibility :sample-android:testDebugUnitTest
 ```
 
 See [`SECURITY.md`](SECURITY.md) for the cryptographic specification, envelope layout, and threat model.

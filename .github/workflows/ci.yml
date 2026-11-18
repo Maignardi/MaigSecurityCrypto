@@ -16,7 +16,7 @@ jobs:
           java-version: 21
       - uses: gradle/actions/setup-gradle@v4
       - name: Run JVM & Android host/sample UI tests, minSdk bytecode check, and compile device tests
-        run: ./gradlew :encrypted-datastore:jvmTest :encrypted-datastore:testAndroidHostTest :encrypted-datastore:verifyAndroidMinSdk23Compatibility :encrypted-datastore:compileAndroidDeviceTest :sample-android:testDebugUnitTest :sample-android:lintDebug
+        run: ./gradlew :MaigSecurityCrypto:jvmTest :MaigSecurityCrypto:testAndroidHostTest :MaigSecurityCrypto:verifyAndroidMinSdk23Compatibility :MaigSecurityCrypto:compileAndroidDeviceTest :sample-android:testDebugUnitTest :sample-android:lintDebug
 
   android-instrumented:
     runs-on: ubuntu-latest
@@ -39,13 +39,13 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          script: ./gradlew :encrypted-datastore:connectedAndroidDeviceTest --info
+          script: ./gradlew :MaigSecurityCrypto:connectedAndroidDeviceTest --info
       - name: Upload instrumented test report on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: android-instrumented-reports
-          path: encrypted-datastore/build/reports/androidTests/
+          path: MaigSecurityCrypto/build/reports/androidTests/
 
   ios-build:
     runs-on: macos-15
@@ -57,4 +57,4 @@ jobs:
           java-version: 21
       - uses: gradle/actions/setup-gradle@v4
       - name: Compile and test iOS targets
-        run: ./gradlew :encrypted-datastore:compileKotlinIosArm64 :encrypted-datastore:iosSimulatorArm64Test
+        run: ./gradlew :MaigSecurityCrypto:compileKotlinIosArm64 :MaigSecurityCrypto:iosSimulatorArm64Test

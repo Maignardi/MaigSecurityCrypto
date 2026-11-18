@@ -20,6 +20,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "encrypted-datastore-root"
-include(":encrypted-datastore")
+rootProject.name = "MaigSecurityCrypto-root"
+include(":MaigSecurityCrypto")
 include(":sample-android")

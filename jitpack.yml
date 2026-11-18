@@ -9,4 +9,4 @@ before_install:
     fi
 
 install:
-  - ./gradlew :encrypted-datastore:publishKotlinMultiplatformPublicationToMavenLocal :encrypted-datastore:publishAndroidPublicationToMavenLocal :encrypted-datastore:publishJvmPublicationToMavenLocal -Pgroup=$GROUP -Pversion=$VERSION -x test --no-daemon
+  - ./gradlew :MaigSecurityCrypto:publishKotlinMultiplatformPublicationToMavenLocal :MaigSecurityCrypto:publishAndroidPublicationToMavenLocal :MaigSecurityCrypto:publishJvmPublicationToMavenLocal -Pgroup=$GROUP -Pversion=$VERSION -x test --no-daemon

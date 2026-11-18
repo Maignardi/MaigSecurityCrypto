@@ -22,7 +22,7 @@ val resolvedGroup = providers.gradleProperty("group").orNull
 val resolvedVersion = providers.gradleProperty("version").orNull
     ?.takeIf { it.isNotBlank() && it != "unspecified" }
     ?: System.getenv("VERSION")?.takeIf { it.isNotBlank() }
-    ?: "0.3.0"
+    ?: "0.3.1"
 
 group = resolvedGroup
 version = resolvedVersion
@@ -208,7 +208,7 @@ publishing {
     repositories {
         maven {
             name = "GitHubPackages"
-            val repo = System.getenv("GITHUB_REPOSITORY") ?: "Maignardi/encrypted-datastore"
+            val repo = System.getenv("GITHUB_REPOSITORY") ?: "Maignardi/MaigSecurityCrypto"
             url = uri("https://maven.pkg.github.com/$repo")
             credentials {
                 username = System.getenv("GITHUB_ACTOR")

@@ -36,7 +36,7 @@ android {
 }
 
 dependencies {
-    implementation(project(":encrypted-datastore"))
+    implementation(project(":MaigSecurityCrypto"))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)

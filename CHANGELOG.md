@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-11-18
+
+### Breaking Changes
+- **Repository, Gradle module & Maven coordinates renamed to `MaigSecurityCrypto`:**
+  - GitHub repository moved to `https://github.com/Maignardi/MaigSecurityCrypto`
+  - Gradle module renamed from `:encrypted-datastore` to `:MaigSecurityCrypto` (`rootProject.name = "MaigSecurityCrypto-root"`)
+  - **JitPack:** `com.github.Maignardi:MaigSecurityCrypto:0.3.1`
+  - **GitHub Packages:** `io.github.maignardi:MaigSecurityCrypto:0.3.1`
+
 ## [0.3.0] - 2026-11-18
 
 ### Breaking Changes (Rebrand to MaigSecurityCrypto)
