@@ -1,0 +1,31 @@
+name: Publish to GitHub Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: macos-15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Publish KMP artifacts to GitHub Packages
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          ./gradlew :encrypted-datastore:publishAllPublicationsToGitHubPackagesRepository \
+            -Pgroup="io.github.${OWNER,,}" \
+            -Pversion="$TAG_VERSION"

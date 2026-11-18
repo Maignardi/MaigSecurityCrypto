@@ -1,0 +1,12 @@
+jdk:
+  - openjdk21
+
+before_install:
+  - |
+    if [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/cmdline-tools" ]; then
+      yes | sdkmanager --licenses >/dev/null 2>&1 || true
+      sdkmanager "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+    fi
+
+install:
+  - ./gradlew :encrypted-datastore:publishKotlinMultiplatformPublicationToMavenLocal :encrypted-datastore:publishAndroidPublicationToMavenLocal :encrypted-datastore:publishJvmPublicationToMavenLocal -Pgroup=$GROUP -Pversion=$VERSION -x test --no-daemon

@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+**/build/
+local.properties
+
+# Kotlin / KMP
+.kotlin/
+**/*.iml
+
+# IDE
+.idea/
+*.ipr
+*.iws
+.vscode/
+
+# OS
+.DS_Store
+
+# Signing & Secrets
+*.jks
+*.keystore
+*.p12
+*.pem
